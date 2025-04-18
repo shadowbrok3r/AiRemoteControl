@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+package.edition = "2024"
+members = [
+    "egui",
+    "orchestrator",
+]
+

@@ -1,0 +1,15 @@
+[package]
+name = "orchestrator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-openai = "0.28" # Or latest
+rmcp = {version = "0.1.5", features = ["client", "transport-sse-server", "transport-io"]}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenv = "0.15"
