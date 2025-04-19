@@ -23,12 +23,14 @@ use std::{collections::VecDeque, env};
 use tokio::net::TcpSocket; // Use TcpSocket for connecting
 use tracing::{debug, error, info, warn};
 
+pub mod computer_use;
+
 // Configuration
 const MCP_SERVER_ADDR: &str = "127.0.0.1:9001"; // Address of your TCP MCP Server
 const MAX_CONVERSATION_DEPTH: usize = 15;
-const OPENAI_CHAT_MODEL: &str = "gpt-4-turbo"; // Or your preferred model like gpt-4o-mini if desired
+const OPENAI_CHAT_MODEL: &str = "gpt-4.1-mini"; // Or your preferred model like gpt-4o-mini if desired
 // *** Added Vision Model constant ***
-const OPENAI_VISION_MODEL: &str = "gpt-4.1-mini"; // Specific model for image analysis
+const OPENAI_VISION_MODEL: &str = "gpt-4.1-nano"; // Specific model for image analysis
 
 #[tokio::main]
 async fn main() -> Result<()> {
