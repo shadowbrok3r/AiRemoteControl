@@ -4,14 +4,18 @@ use anyhow::{anyhow, Context}; use base64::Engine;
 use screenshots::Screen;
 // *** Add display-info import ***
 use display_info::DisplayInfo;
+// *** Using enigo now ***
 use enigo::{
     Button, Coordinate,
-    Direction,
-    Enigo, Key, Keyboard, Mouse, Settings,
+    Direction, // For key press/release/click actions
+    Enigo, Key, Keyboard, Mouse, Settings, // Note: enigo::Mouse/Keyboard traits
 };
+// *** Added for wait tool ***
+use tokio::time::{sleep, Duration};
+
 
 // --- Specific rmcp Imports ---
-use rmcp::schemars; // For deriving schema
+use rmcp::{schemars, tool_box}; // For deriving schema
 use rmcp::handler::server::ServerHandler;
 // use rmcp::transport::stdio;
 use tokio::net::TcpListener; // Added TcpListener
@@ -23,35 +27,44 @@ use rmcp::model::{
 };
 // Added serve_server back
 // *** Ensure tool_box is imported ***
+// Removed rmcp::tool_box from here as it's applied via attribute macro
 use rmcp::{serve_server, tool}; // Keep McpError for type alias if needed internally
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::process::Command;
 use tracing::{info, warn}; // Added warn
 use tracing_subscriber::EnvFilter; // Import EnvFilter for tracing setup
 
 // --- Tool Parameter Struct Definitions ---
 
+// Structs for existing custom tools
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct GetScreenDetailsParams {
+    #[schemars(description = "Ignored dummy field.")]
+    _dummy: Option<bool>,
+}
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct GetMousePositionParams {
+     #[schemars(description = "Ignored dummy field.")]
+    _dummy: Option<bool>,
+}
 #[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
 struct MoveMouseParams {
-    #[schemars(description = "Target X coordinate (absolute pixel value).")]
+    #[schemars(description = "Target X coordinate.")]
     x: i32,
-    #[schemars(description = "Target Y coordinate (absolute pixel value).")]
+    #[schemars(description = "Target Y coordinate.")]
     y: i32,
     #[schemars(description = "Type of mouse move ('Absolute'/'Abs' for absolute coordinates, 'Relative'/'Rel' for relative offset).")]
     coordinate: String
 }
-
 #[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
-struct MouseClickParams {
-    #[schemars(description = "Which mouse button/action ('Left', 'Right', 'Middle', 'Back', 'Forward', 'ScrollUp', 'ScrollDown'). Case-insensitive.")]
-    button: String, // Consider using an enum in production
+struct MouseClickParams { // Renamed to avoid conflict, used by 'mouse_action' tool
+    #[schemars(description = "Which mouse button/action ('Left', 'Right', 'Middle', 'Back', 'Forward', 'ScrollUp', 'ScrollDown', 'ScrollLeft', 'ScrollRight'). Case-insensitive.")]
+    button: String,
     #[schemars(description = "Type of action ('Click', 'Press', 'Release'). Default is 'Click'. Double click not directly supported.", default)]
     click_type: Option<String>,
 }
-
-
-// *** Added consolidated KeyboardActionParams ***
 #[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
 struct KeyboardActionParams {
     #[schemars(description = "Optional: Text to type using enigo's text input method.")]
@@ -61,7 +74,6 @@ struct KeyboardActionParams {
     #[schemars(description = "Action for the specified 'key': 'Click' (default), 'Press', 'Release'. Ignored if 'text' is used.", default)]
     key_action: Option<String>,
 }
-
 #[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
 struct CaptureScreenParams {
     #[schemars(description = "Optional X coordinate of the top-left corner for regional capture.")]
@@ -72,22 +84,55 @@ struct CaptureScreenParams {
     width: Option<u32>,
     #[schemars(description = "Optional height for regional capture.")]
     height: Option<u32>,
-    // Maybe add monitor index parameter later
 }
-
-// *** Added dummy struct for parameterless tool ***
-#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
-struct GetScreenDetailsParams;
-
-// *** Added dummy struct for parameterless tool ***
-#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
-struct GetMousePositionParams;
-
 #[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
 struct RunShellParams {
     command: String,
     args: Vec<String>,
 }
+
+// --- Structs for NEW OpenAI Action Tools ---
+
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct OpenAIClickParams {
+    #[schemars(description = "X coordinate for the click.")]
+    x: i32,
+    #[schemars(description = "Y coordinate for the click.")]
+    y: i32,
+    #[schemars(description = "Button to click ('left', 'right', 'middle').")]
+    button: String,
+}
+
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct OpenAIScrollParams {
+     #[schemars(description = "X coordinate where scroll should originate.")]
+    x: i32,
+    #[schemars(description = "Y coordinate where scroll should originate.")]
+    y: i32,
+    #[schemars(description = "Pixels to scroll horizontally (positive right, negative left).")]
+    scroll_x: i32,
+    #[schemars(description = "Pixels to scroll vertically (positive down, negative up).")]
+    scroll_y: i32,
+}
+
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct OpenAIKeyPressParams {
+    #[schemars(description = "Array of key names to press sequentially (e.g., ['Control', 'c']). Mapping based on enigo::Key.")]
+    keys: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct OpenAITypeParams {
+     #[schemars(description = "The text string to type.")]
+    text: String,
+}
+
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct OpenAIWaitParams {
+     #[schemars(description = "Optional duration in milliseconds to wait. Defaults to 2000ms if not provided.", default)]
+    duration_ms: Option<u64>,
+}
+
 
 // --- Tool Provider Implementation ---
 
@@ -95,21 +140,20 @@ struct RunShellParams {
 struct DesktopToolProvider;
 
 // *** First impl block: Contains the tool definitions ***
-#[tool(tool_box)] // Apply tool_box here as well
+#[tool(tool_box)]// Apply tool_box here as well
 impl DesktopToolProvider {
 
-    // --- Screen Calibration ---
+    // --- Existing Custom Tools (Unchanged) ---
+
     #[tool(name = "get_screen_details", description = "Gets the primary screen resolution (width and height).")]
-    // *** Restored user implementation, adjusted return type and error handling pattern ***
     async fn get_screen_details(
         &self,
-        #[tool(param)] _params: GetScreenDetailsParams // Use dummy struct
+        #[tool(aggr)] _params: GetScreenDetailsParams // Use dummy struct with aggr
     ) -> Result<CallToolResult, ErrorData> {
         info!("Received request to get screen details.");
-        // Apply user's required error pattern
         let display_infos = DisplayInfo::all()
-            .map_err(|e| anyhow!(e).context("display_info::DisplayInfo::all() failed")) // Map specific error -> anyhow
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?; // Map anyhow -> ErrorData
+            .map_err(|e| anyhow!(e).context("display_info::DisplayInfo::all() failed"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
         let primary = display_infos
             .iter()
@@ -118,31 +162,27 @@ impl DesktopToolProvider {
 
         if let Some(primary_screen) = primary {
             let result_json = json!({
-                "status": "success", // Indicate success
+                "status": "success",
                 "width": primary_screen.width,
                 "height": primary_screen.height,
                 "scale_factor": primary_screen.scale_factor,
                 "x": primary_screen.x,
                 "y": primary_screen.y
             });
-            // Apply user's required error pattern to Content::json
             Ok(CallToolResult::success(vec![Content::json(result_json)
                 .map_err(|e| anyhow!(e).context("Failed to serialize screen details to JSON"))
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
             ]))
         } else {
-            // Return ErrorData directly for logical errors
             Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR, // Or a more specific code like NotFound
+                ErrorCode::INTERNAL_ERROR,
                 "Could not find primary or any display".to_string(),
                 None
             ))
         }
     }
 
-    // --- Mouse Tools ---
     #[tool(name = "move_mouse", description = "Moves the mouse cursor")]
-     // *** Return Result<..., ErrorData> ***
     async fn move_mouse(
         &self,
         #[tool(aggr)] params: MoveMouseParams
@@ -153,61 +193,34 @@ impl DesktopToolProvider {
 
         let coordinate = match params.coordinate.to_lowercase().as_str() {
             "absolute" | "abs" => Coordinate::Abs,
-            "relative" | "rel" | _ => Coordinate::Rel, // Default to Relative
+            "relative" | "rel" | _ => Coordinate::Rel,
         };
-
-        if coordinate == Coordinate::Rel {
-            info!("Moving mouse relatively by ({}, {})", params.x, params.y);
-        } else {
-             info!("Moving mouse absolutely to ({}, {})", params.x, params.y);
-        }
+        if coordinate == Coordinate::Rel { info!("Moving mouse relatively by ({}, {})", params.x, params.y); }
+        else { info!("Moving mouse absolutely to ({}, {})", params.x, params.y); }
 
         enigo.move_mouse(params.x, params.y, coordinate)
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("Couldnt move mouse: {e:?}"), None))?;
 
-        let (x, y) = enigo
-            .location()
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-
+        let (x, y) = enigo.location().map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         info!("Mouse moved successfully.");
-        // Apply user's required error pattern to Content::json
-        Ok(CallToolResult::success(
-            vec![
-                Content::json(
-                    json!({
-                        "status": "success", // Indicate success
-                        "current_x": x, // Return current position after move
-                        "current_y": y
-                    })
-                )
-                .map_err(|e| anyhow!(e).context("Failed to serialize move_mouse result"))
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
-            ]
-        ))
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success", "current_x": x, "current_y": y }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize move_mouse result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
     }
 
-    // *** Added: get_mouse_position ***
     #[tool(name = "get_mouse_position", description = "Gets the current absolute screen coordinates (X, Y) of the mouse cursor")]
-    // *** Return Result<..., ErrorData> ***
     async fn get_mouse_position(
         &self,
-        #[tool(param)] _params: GetMousePositionParams,
+        #[tool(aggr)] _params: GetMousePositionParams, // Use aggr with dummy struct
     ) -> Result<CallToolResult, ErrorData> {
         info!("Executing get mouse position.");
         let enigo = Enigo::new(&Settings::default())
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
-        let (x, y) = enigo
-            .location()
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-
+        let (x, y) = enigo.location().map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         info!("Mouse position retrieved successfully: ({}, {})", x, y);
-        let result_json = json!({
-            "status": "success",
-            "x": x,
-            "y": y
-        });
-         // Apply user's required error pattern to Content::json
+        let result_json = json!({ "status": "success", "x": x, "y": y });
         Ok(CallToolResult::success(vec![Content::json(result_json)
             .map_err(|e| anyhow!(e).context("Failed to serialize get_mouse_position result"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
@@ -215,12 +228,11 @@ impl DesktopToolProvider {
     }
 
     #[tool(name = "mouse_action", description = "Performs a mouse action (click, press, release) or scrolls the mouse wheel using enigo.")]
-     // *** Return Result<..., ErrorData> ***
     async fn mouse_action(
         &self,
         #[tool(aggr)] params: MouseClickParams
     ) -> Result<CallToolResult, ErrorData> {
-        info!("Executing mouse click: {:?}", params);
+        info!("Executing mouse action: {:?}", params);
         let mut enigo = Enigo::new(&Settings::default())
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
@@ -228,39 +240,23 @@ impl DesktopToolProvider {
         let action_str = params.click_type.as_deref().unwrap_or("click").to_lowercase();
 
         let direction = match action_str.as_str() {
-            "click" => Direction::Click,
-            "press" => Direction::Press,
-            "release" => Direction::Release,
-            "double" => {
-                warn!("Double click not yet implemented, performing single click instead.");
-                Direction::Click
-            }
-            _ => Direction::Click
+            "click" => Direction::Click, "press" => Direction::Press, "release" => Direction::Release,
+            "double" => { warn!("Double click not directly supported by enigo, performing single click instead."); Direction::Click }
+            _ => { warn!("Invalid click_type '{}', defaulting to Click.", action_str); Direction::Click }
         };
 
         let button_enum = match button_str.as_str() {
-            "left" => Button::Left,
-            "right" => Button::Right,
-            "middle" => Button::Middle,
-            "back" => Button::Back, // Keep Back/Forward if needed
-            "forward" => Button::Forward,
+            "left" => Button::Left, "right" => Button::Right, "middle" => Button::Middle,
+            "back" => Button::Back, "forward" => Button::Forward,
             "scrollup" | "scroll_up" => Button::ScrollUp,
             "scrolldown" | "scroll_down" => Button::ScrollDown,
-            "scrollleft" | "scroll_left" => Button::ScrollLeft, // Add scroll left/right
+            "scrollleft" | "scroll_left" => Button::ScrollLeft,
             "scrollright" | "scroll_right" => Button::ScrollRight,
-            _ => return Err(ErrorData::invalid_params(
-                format!("Invalid mouse button/action specified: '{}'. Use 'Left', 'Right', 'Middle', 'ScrollUp', 'ScrollDown', etc.", params.button),
-                None
-            )),
+            _ => return Err(ErrorData::invalid_params( format!("Invalid mouse button/action specified: '{}'.", params.button), None)),
         };
-        
-        enigo
-            .button(button_enum, direction)
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
-        info!("Mouse clicked successfully: {}", button_str);
-
-        // Apply user's required error pattern to Content::json
+        enigo.button(button_enum, direction).map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+        info!("Mouse action successful: Button='{}', Action='{:?}'", button_str, direction);
         Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success", "button": button_str, "action": action_str }))
             .map_err(|e| anyhow!(e).context("Failed to serialize mouse_action result"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
@@ -276,174 +272,269 @@ impl DesktopToolProvider {
         let mut enigo = Enigo::new(&Settings::default())
              .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
-        // Prefer key action over typing text if both are provided
         if let Some(key_str) = &params.key {
             let action_str = params.key_action.as_deref().unwrap_or("click").to_lowercase();
             info!("Performing key action: key='{}', action='{}'", key_str, action_str);
-
             let direction = match action_str.as_str() {
-                "click" => Direction::Click,
-                "press" => Direction::Press,
-                "release" => Direction::Release,
-                 _ => {
-                    warn!("Invalid key_action '{}', defaulting to Click.", action_str);
-                    Direction::Click
-                }
+                "click" => Direction::Click, "press" => Direction::Press, "release" => Direction::Release,
+                 _ => { warn!("Invalid key_action '{}', defaulting to Click.", action_str); Direction::Click }
             };
-
-            // Map string to enigo::Key
-            // This requires a comprehensive mapping. Add common keys here.
             let key_enum = match key_str.to_lowercase().as_str() {
-                "alt" => Key::Alt,
-                "backspace" => Key::Backspace,
-                "capslock" | "caps_lock" => Key::CapsLock,
-                "control" | "ctrl" => Key::Control,
-                "delete" => Key::Delete,
-                "down" | "downarrow" => Key::DownArrow,
-                "end" => Key::End,
-                "escape" | "esc" => Key::Escape,
-                "f1" => Key::F1, "f2" => Key::F2, "f3" => Key::F3, "f4" => Key::F4,
-                "f5" => Key::F5, "f6" => Key::F6, "f7" => Key::F7, "f8" => Key::F8,
-                "f9" => Key::F9, "f10" => Key::F10, "f11" => Key::F11, "f12" => Key::F12,
-                "home" => Key::Home,
-                "left" | "leftarrow" => Key::LeftArrow,
-                "meta" | "win" | "command" | "super" | "windows" => Key::Meta,
-                "option" => Key::Option, // Typically Alt on Windows/Linux, Option on macOS
-                "pagedown" | "page_down" => Key::PageDown,
-                "pageup" | "page_up" => Key::PageUp,
-                "return" | "enter" => Key::Return,
-                "right" | "rightarrow" => Key::RightArrow,
-                "shift" => Key::Shift,
-                "space" => Key::Space,
-                "tab" => Key::Tab,
-                "up" | "uparrow" => Key::UpArrow,
-                // Handle single characters directly using Key::Layout
+                "alt" | "altgraph" => Key::Alt, "backspace" => Key::Backspace, "capslock" | "caps_lock" => Key::CapsLock,
+                "control" | "ctrl" => Key::Control, "delete" => Key::Delete, "down" | "downarrow" => Key::DownArrow,
+                "end" => Key::End, "escape" | "esc" => Key::Escape,
+                "f1" => Key::F1, "f2" => Key::F2, "f3" => Key::F3, "f4" => Key::F4, "f5" => Key::F5,
+                "f6" => Key::F6, "f7" => Key::F7, "f8" => Key::F8, "f9" => Key::F9, "f10" => Key::F10,
+                "f11" => Key::F11, "f12" => Key::F12, "home" => Key::Home, "left" | "leftarrow" => Key::LeftArrow,
+                "meta" | "win" | "command" | "super" | "windows" => Key::Meta, "option" => Key::Option,
+                "pagedown" | "page_down" => Key::PageDown, "pageup" | "page_up" => Key::PageUp,
+                "return" | "enter" => Key::Return, "right" | "rightarrow" => Key::RightArrow,
+                "shift" => Key::Shift, "space" => Key::Space, "tab" => Key::Tab, "up" | "uparrow" => Key::UpArrow,
                 s if s.chars().count() == 1 => Key::Unicode(s.chars().next().unwrap()),
-                // Handle Unicode characters if needed (though enigo::text is better)
-                // s if s.starts_with("U+") => Key::Unicode(...)
-                _ => return Err(ErrorData::invalid_params(
-                    format!("Unsupported key specified: '{}'.", key_str), None
-                )),
+                _ => return Err(ErrorData::invalid_params( format!("Unsupported key specified: '{}'.", key_str), None)),
             };
-
-            enigo.key(key_enum, direction)
-                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+            enigo.key(key_enum, direction).map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
             info!("Key action successful.");
             Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success", "key": key_str, "action": action_str }))
                 .map_err(|e| anyhow!(e).context("Failed to serialize keyboard key action result"))
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
             ]))
-
         } else if let Some(text_to_type) = &params.text {
             info!("Typing text: '{}'", text_to_type);
-            enigo.text(text_to_type)
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+            enigo.text(text_to_type).map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
             info!("Text typing successful.");
             Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success", "text_typed": text_to_type }))
                 .map_err(|e| anyhow!(e).context("Failed to serialize keyboard text typing result"))
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
             ]))
         } else {
-            Err(ErrorData::invalid_params(
-                "Keyboard action requires either 'key' or 'text' parameter.".to_string(), None
-            ))
+            Err(ErrorData::invalid_params("Keyboard action requires either 'key' or 'text' parameter.".to_string(), None))
         }
     }
 
-    // --- Screen Capture ---
     #[tool(name = "capture_screen", description = "Captures the screen (or a region) and returns image data as base64.")]
     async fn capture_screen(
         &self,
         #[tool(aggr)] params: CaptureScreenParams
     ) -> Result<CallToolResult, ErrorData> {
         info!("Executing screen capture with params: {:?}", params);
-
-        // *** Apply user's required error pattern ***
         let screens = Screen::all()
             .context("Failed to get screen list")
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-
         let screen_to_capture = screens.first()
-            .ok_or_else(|| anyhow!("No screen found to capture")) // Creates anyhow::Error
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?; // Map anyhow -> ErrorData
+            .ok_or_else(|| anyhow!("No screen found to capture"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         info!("Capturing from screen ID: {}", screen_to_capture.display_info.id);
-
-
         let image = if let (Some(x), Some(y), Some(w), Some(h)) = (params.x, params.y, params.width, params.height) {
              info!("Capturing region: x={}, y={}, width={}, height={}", x, y, w, h);
-             // *** Apply user's required error pattern ***
              screen_to_capture.capture_area(x, y, w, h)
-                .context("Failed to capture screen area") // Creates anyhow::Error
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))? // Map anyhow -> ErrorData
+                .context("Failed to capture screen area")
+                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         } else {
              info!("Capturing full screen.");
-             // *** Apply user's required error pattern ***
              screen_to_capture.capture()
-                .context("Failed to capture full screen") // Creates anyhow::Error
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))? // Map anyhow -> ErrorData
+                .context("Failed to capture full screen")
+                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         };
         info!("Capture successful ({}x{})", image.width(), image.height());
-
         let base64_image = base64::engine::general_purpose::STANDARD.encode(image.as_raw());
         info!("Encoded image to base64 (length: {})", base64_image.len());
-
-
         let result_json = json!({
-            "status": "success",
-            "format": "png",
-            "width": image.width(),
-            "height": image.height(),
-            "base64_data": base64_image,
+            "status": "success", "format": "png", "width": image.width(), "height": image.height(), "base64_data": base64_image,
         });
-        // Apply user's required error pattern to Content::json
         Ok(CallToolResult::success(vec![Content::json(result_json)
             .map_err(|e| anyhow!(e).context("Failed to serialize capture_screen result"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         ]))
     }
 
-    // --- Shell Command ---
     #[tool(name = "run_shell_command", description = "Runs a command in the default system shell.")]
      async fn run_shell_command(
         &self,
         #[tool(aggr)] params: RunShellParams
     ) -> Result<CallToolResult, ErrorData> {
         info!("Received request to run command: {:?}", params);
-
-        // *** Apply user's required error pattern ***
-        let output = tokio::process::Command::new(&params.command)
+        let output = Command::new(&params.command)
             .args(&params.args)
-            .kill_on_drop(true)
             .output()
-            .await
-            .context(format!("Failed to execute command: {}", params.command)) // Creates anyhow::Error
-            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?; // Map anyhow -> ErrorData
-
+            .context(format!("Failed to execute command: {}", params.command))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let exit_code = output.status.code().unwrap_or(-1);
-
-        info!(
-            "Command '{}' executed. Status: {}, Stdout len: {}, Stderr len: {}",
-            params.command, exit_code, stdout.len(), stderr.len()
-        );
-
-        let result_json = json!({
-            "status": if output.status.success() { "success" } else { "error" },
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "stderr": stderr,
-        });
-
-        // Apply user's required error pattern to Content::json
+        info!( "Command '{}' executed. Status: {}, Stdout len: {}, Stderr len: {}", params.command, exit_code, stdout.len(), stderr.len());
+        let result_json = json!({ "status": if output.status.success() { "success" } else { "error" }, "exit_code": exit_code, "stdout": stdout, "stderr": stderr, });
         Ok(CallToolResult::success(vec![Content::json(result_json)
              .map_err(|e| anyhow!(e).context("Failed to serialize run_shell_command result"))
              .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         ]))
     }
+
+    // --- NEW Tools for OpenAI Computer Use Actions ---
+
+    #[tool(name = "execute_openai_click", description = "Executes a mouse click action requested by the OpenAI Computer Use model.")]
+    async fn execute_openai_click(
+        &self,
+        #[tool(aggr)] params: OpenAIClickParams
+    ) -> Result<CallToolResult, ErrorData> {
+        info!("Executing OpenAI action: click at ({}, {}) with button '{}'", params.x, params.y, params.button);
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+        // Move mouse first
+        enigo.move_mouse(params.x, params.y, Coordinate::Abs)
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Click: Failed to move mouse: {e:?}"), None))?;
+
+        // Determine button
+        let button_enum = match params.button.to_lowercase().as_str() {
+            "left" => Button::Left,
+            "right" => Button::Right,
+            "middle" => Button::Middle,
+            _ => return Err(ErrorData::invalid_params(format!("OpenAI Click: Invalid button '{}'", params.button), None)),
+        };
+
+        // Perform click
+        enigo.button(button_enum, Direction::Click)
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Click: Failed to click button: {e:?}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success" }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize execute_openai_click result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+    }
+
+    #[tool(name = "execute_openai_scroll", description = "Executes a mouse scroll action requested by the OpenAI Computer Use model.")]
+    async fn execute_openai_scroll(
+        &self,
+        #[tool(aggr)] params: OpenAIScrollParams
+    ) -> Result<CallToolResult, ErrorData> {
+        info!("Executing OpenAI action: scroll at ({}, {}) with delta ({}, {})", params.x, params.y, params.scroll_x, params.scroll_y);
+        let mut enigo = Enigo::new(&Settings::default())
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+        // Move mouse to scroll origin first
+        enigo.move_mouse(params.x, params.y, Coordinate::Abs)
+             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Scroll: Failed to move mouse: {e:?}"), None))?;
+
+        // Perform scroll - enigo uses Button enum for scroll direction
+        // Note: This scrolls once per direction. Magnitude requires looping.
+        if params.scroll_y != 0 {
+            let button = if params.scroll_y < 0 { Button::ScrollUp } else { Button::ScrollDown };
+            let count = params.scroll_y.abs();
+            info!("Scrolling vertically: {:?} {} times", button, count);
+            for _ in 0..count { // Loop for magnitude
+                 enigo.button(button, Direction::Click)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Scroll: Failed vertical scroll: {e:?}"), None))?;
+                 // Optional small delay between scroll clicks might be needed
+                 // tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        if params.scroll_x != 0 {
+             let button = if params.scroll_x < 0 { Button::ScrollLeft } else { Button::ScrollRight };
+             let count = params.scroll_x.abs();
+             info!("Scrolling horizontally: {:?} {} times", button, count);
+             for _ in 0..count { // Loop for magnitude
+                 enigo.button(button, Direction::Click)
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Scroll: Failed horizontal scroll: {e:?}"), None))?;
+                 // Optional small delay
+                 // tokio::time::sleep(Duration::from_millis(10)).await;
+             }
+        }
+
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success" }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize execute_openai_scroll result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+    }
+
+     #[tool(name = "execute_openai_keypress", description = "Executes key presses requested by the OpenAI Computer Use model.")]
+    async fn execute_openai_keypress(
+        &self,
+        #[tool(aggr)] params: OpenAIKeyPressParams
+    ) -> Result<CallToolResult, ErrorData> {
+        info!("Executing OpenAI action: keypress sequence: {:?}", params.keys);
+        let mut enigo = Enigo::new(&Settings::default())
+             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+        // OpenAI keypress action sends an array of keys to be pressed sequentially (like modifiers + key)
+        // We simulate this by pressing down all keys then releasing them in reverse.
+        // This might need refinement based on observed OpenAI behavior.
+        let mut key_enums = Vec::new();
+        for key_str in &params.keys {
+             let key_enum = match key_str.to_lowercase().as_str() {
+                "alt" | "altgraph" => Key::Alt, "backspace" => Key::Backspace, "capslock" | "caps_lock" => Key::CapsLock,
+                "control" | "ctrl" => Key::Control, "delete" => Key::Delete, "down" | "downarrow" => Key::DownArrow,
+                "end" => Key::End, "escape" | "esc" => Key::Escape,
+                "f1" => Key::F1, "f2" => Key::F2, "f3" => Key::F3, "f4" => Key::F4, "f5" => Key::F5,
+                "f6" => Key::F6, "f7" => Key::F7, "f8" => Key::F8, "f9" => Key::F9, "f10" => Key::F10,
+                "f11" => Key::F11, "f12" => Key::F12, "home" => Key::Home, "left" | "leftarrow" => Key::LeftArrow,
+                "meta" | "win" | "command" | "super" | "windows" => Key::Meta, "option" => Key::Option,
+                "pagedown" | "page_down" => Key::PageDown, "pageup" | "page_up" => Key::PageUp,
+                "return" | "enter" => Key::Return, "right" | "rightarrow" => Key::RightArrow,
+                "shift" => Key::Shift, "space" => Key::Space, "tab" => Key::Tab, "up" | "uparrow" => Key::UpArrow,
+                s if s.chars().count() == 1 => Key::Unicode(s.chars().next().unwrap()),
+                _ => return Err(ErrorData::invalid_params(format!("OpenAI Keypress: Unsupported key specified: '{}'.", key_str), None)),
+            };
+            key_enums.push(key_enum);
+        }
+
+        // Press keys down
+        for key_enum in &key_enums {
+             enigo.key(*key_enum, Direction::Press)
+                  .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Keypress: Failed to press key '{:?}': {}", key_enum, e), None))?;
+        }
+        // Release keys in reverse order
+        for key_enum in key_enums.iter().rev() {
+             enigo.key(*key_enum, Direction::Release)
+                  .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Keypress: Failed to release key '{:?}': {}", key_enum, e), None))?;
+        }
+
+        info!("OpenAI keypress sequence executed successfully.");
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success" }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize execute_openai_keypress result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+    }
+
+     #[tool(name = "execute_openai_type", description = "Executes typing text requested by the OpenAI Computer Use model.")]
+    async fn execute_openai_type(
+        &self,
+        #[tool(aggr)] params: OpenAITypeParams
+    ) -> Result<CallToolResult, ErrorData> {
+        info!("Executing OpenAI action: type text: '{}'", params.text);
+        let mut enigo = Enigo::new(&Settings::default())
+             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+        enigo.text(&params.text)
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, format!("OpenAI Type: Failed to type text: {e:?}"), None))?;
+
+        info!("OpenAI text typing successful.");
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success" }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize execute_openai_type result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+    }
+
+     #[tool(name = "execute_openai_wait", description = "Executes a wait/sleep action requested by the OpenAI Computer Use model.")]
+    async fn execute_openai_wait(
+        &self,
+        #[tool(aggr)] params: OpenAIWaitParams
+    ) -> Result<CallToolResult, ErrorData> {
+        let duration_ms = params.duration_ms.unwrap_or(2000); // Default to 2000ms if not specified
+        info!("Executing OpenAI action: wait for {} ms", duration_ms);
+
+        sleep(Duration::from_millis(duration_ms)).await;
+
+        info!("Wait completed.");
+        Ok(CallToolResult::success(vec![Content::json(json!({ "status": "success", "duration_ms": duration_ms }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize execute_openai_wait result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+    }
+
 }
 
-#[tool(tool_box)]
+#[tool(tool_box)] // Added missing attribute
 impl ServerHandler for DesktopToolProvider {
     // Provide basic server information
     fn get_info(&self) -> ServerInfo {
@@ -453,7 +544,7 @@ impl ServerHandler for DesktopToolProvider {
                 .enable_tools()
                 .build(),
             server_info: Implementation::from_build_env(),
-            instructions: Some("This server allows controlling the desktop via various tools (mouse, keyboard, screen capture, shell commands).".to_string()),
+            instructions: Some("This server allows controlling the desktop via various tools (mouse, keyboard, screen capture, shell commands). It also includes tools specifically for executing actions requested by OpenAI's Computer Use API.".to_string()), // Updated instructions slightly
         }
     }
     // Add other ServerHandler methods if needed

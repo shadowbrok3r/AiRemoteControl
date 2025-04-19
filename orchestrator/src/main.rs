@@ -1,33 +1,34 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result}; // Added anyhow for bail macro
 use async_openai::{
+    config::Config, // *** Added Config import ***
+    error::OpenAIError, // *** Added OpenAIError import ***
     types::{
-        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
-        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        // Removed ChatCompletionMessageToolCall as it's unused
-        ChatCompletionTool, ChatCompletionToolChoiceOption, ChatCompletionToolType,
-        CreateChatCompletionRequest, FunctionObject,
-        Role,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent, 
+        ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage, 
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, 
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage, 
+        ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption, 
+        ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject, ImageDetail, ImageUrl, Role // *** Changed ImageUrlDetail to ImageDetail ***
     },
-    Client as OpenAIClient,
+    Client as OpenAIClient, // Alias for Client<C>
 };
 use rmcp::{
-    // Removed ListToolsRequest, RawContent. Removed Content, Tool alias.
-    model::{CallToolRequestParam, RawContent}, // Removed ListToolsRequest
+    // Added ListToolsRequest, RawContent. Removed Content, Tool alias.
+    model::{CallToolRequestParam, RawContent}, // Removed ListToolsRequest import error, use None below
     service::{RoleClient, RunningService}, // RoleClient likely needs feature flag
     serve_client, // serve_client likely needs feature flag
 };
 use serde_json::{json, Map, Value}; // Added Map
-use std::{collections::VecDeque, env}; // Removed Cow import
+use std::{collections::VecDeque, env};
 use tokio::net::TcpSocket; // Use TcpSocket for connecting
 use tracing::{debug, error, info, warn};
 
 // Configuration
 const MCP_SERVER_ADDR: &str = "127.0.0.1:9001"; // Address of your TCP MCP Server
-const MAX_CONVERSATION_DEPTH: usize = 15; // Limit conversation history
-const OPENAI_MODEL: &str = "gpt-4.1-mini"; // Or your preferred model
+const MAX_CONVERSATION_DEPTH: usize = 15;
+const OPENAI_CHAT_MODEL: &str = "gpt-4-turbo"; // Or your preferred model like gpt-4o-mini if desired
+// *** Added Vision Model constant ***
+const OPENAI_VISION_MODEL: &str = "gpt-4.1-mini"; // Specific model for image analysis
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,9 +62,8 @@ async fn main() -> Result<()> {
 
     // --- Fetch Tools from MCP Server ---
     info!("Fetching tools from MCP server...");
-    // *** Call list_tools() without arguments ***
     let mcp_tools_result = mcp_peer
-        .list_tools(None) // Call without arguments
+        .list_tools(None) // Use None for default options
         .await
         .context("Failed to list tools from MCP server")?;
     info!("Available tools: {:?}", mcp_tools_result.tools.iter().map(|t| &t.name).collect::<Vec<_>>());
@@ -73,7 +73,16 @@ async fn main() -> Result<()> {
         .tools
         .into_iter()
         .map(|mcp_tool| {
-            let parameters_value = Some(Value::Object(mcp_tool.input_schema.as_ref().clone()));
+            // Schema Patching Logic
+            let parameters_value: Option<Value> = {
+                let needs_patch = mcp_tool.input_schema.get("properties").is_none();
+                if needs_patch {
+                    info!("Patching schema for parameterless tool: {}", mcp_tool.name);
+                    Some(json!({"type": "object", "properties": {}}))
+                } else {
+                    Some(Value::Object(mcp_tool.input_schema.as_ref().clone()))
+                }
+            };
 
             ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
@@ -96,7 +105,7 @@ async fn main() -> Result<()> {
 
     // --- Main Interaction Loop ---
     let mut conversation_history: VecDeque<ChatCompletionRequestMessage> = VecDeque::new();
-    let system_prompt = "You are a helpful AI assistant. You can control the user's desktop using the available tools. Analyze the user's request and use the tools provided to fulfill it step-by-step. Ask for clarification if the request is ambiguous. Inform the user upon successful completion or if an error occurs.".to_string();
+    let system_prompt = "You are a helpful AI assistant. You can control the user's desktop using the available tools. Analyze the user's request and use the tools provided to fulfill it step-by-step. Ask for clarification if the request is ambiguous. Inform the user upon successful completion or if an error occurs. When asked to analyze a screen capture, use the textual description provided as the result of the 'capture_screen' tool.".to_string();
     conversation_history.push_back(ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage{
         content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
         name: None
@@ -126,11 +135,11 @@ async fn main() -> Result<()> {
 
         // --- Call OpenAI Loop (Handles potential multi-step tool calls) ---
         loop {
-            info!("Sending request to OpenAI...");
+            info!("Sending request to OpenAI chat model...");
             debug!("Conversation History: {:?}", conversation_history);
 
             let request = CreateChatCompletionRequest {
-                model: OPENAI_MODEL.to_string(),
+                model: OPENAI_CHAT_MODEL.to_string(),
                 messages: conversation_history.iter().cloned().collect(),
                 tools: if openai_tools.is_empty() { None } else { Some(openai_tools.clone()) },
                 tool_choice: if openai_tools.is_empty() { None } else { Some(ChatCompletionToolChoiceOption::Auto) },
@@ -140,12 +149,29 @@ async fn main() -> Result<()> {
             let response = match openai_client.chat().create(request).await {
                  Ok(res) => res,
                  Err(e) => {
+                     // *** Use match on OpenAIError variants instead of downcast_ref ***
                      error!("OpenAI API error: {}", e);
-                     println!("Error communicating with OpenAI. Please try again.");
+                     match e {
+                         OpenAIError::ApiError(api_error) => {
+                             error!("OpenAI API Error Details: {:?}", api_error);
+                             if let Some(code) = &api_error.code {
+                                 println!("OpenAI Error Code: {}", code);
+                             }
+                         }
+                         OpenAIError::Reqwest(req_err) => {
+                              error!("Network Error Details: {:?}", req_err);
+                         }
+                         // Add other OpenAIError variants as needed
+                         _ => {
+                              error!("Other OpenAI Error: {:?}", e);
+                         }
+                     }
+                     println!("Error communicating with OpenAI. Please check logs and API key/quota. Try again.");
                      conversation_history.pop_back(); // Allow retry
                      break; // Break inner loop
                  }
             };
+
 
             let choice = match response.choices.into_iter().next() {
                  Some(ch) => ch,
@@ -156,12 +182,11 @@ async fn main() -> Result<()> {
                  }
             };
 
-            // Construct the request assistant message from the response message
             let assistant_message_request = ChatCompletionRequestAssistantMessage {
                 content: choice.message.content.clone().map(ChatCompletionRequestAssistantMessageContent::Text),
                 name: None,
                 tool_calls: choice.message.tool_calls.clone(),
-                function_call: choice.message.function_call.clone(), // Deprecated but include
+                function_call: choice.message.function_call.clone(),
                 audio: None,
                 refusal: None,
             };
@@ -210,23 +235,45 @@ async fn main() -> Result<()> {
                     let tool_result_content_str: String = match mcp_peer.call_tool(mcp_request.clone()).await {
                         Ok(mcp_result) => {
                             info!("MCP tool '{}' executed successfully.", mcp_request.name);
-                            match mcp_result.content.into_iter().next() { // Use .contents field
+                            // *** Use mcp_result.content, not .contents ***
+                            match mcp_result.content.into_iter().next() {
                                 Some(content) => {
-                                    match content.raw { // Access .raw field of Annotated<RawContent>
+                                    match content.raw {
                                         RawContent::Text(raw_text_content) => {
-                                            raw_text_content.text
+                                            if mcp_request.name == "capture_screen" {
+                                                info!("Received screen capture result, attempting analysis...");
+                                                match serde_json::from_str::<Value>(&raw_text_content.text) {
+                                                    Ok(json_val) => {
+                                                        if let Some(base64_data) = json_val.get("base64_data").and_then(|v| v.as_str()) {
+                                                            let vision_prompt = "Describe this screenshot in detail. If there is a text editor open, please also read the text visible within it.".to_string();
+                                                            match analyze_image_with_vision(&openai_client, vision_prompt, base64_data).await {
+                                                                Ok(description) => {
+                                                                    info!("Vision analysis successful.");
+                                                                    description
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("Vision analysis failed: {}", e);
+                                                                    format!("Screenshot captured but vision analysis failed: {}", e)
+                                                                }
+                                                            }
+                                                        } else {
+                                                            warn!("capture_screen result JSON did not contain 'base64_data' string.");
+                                                            raw_text_content.text
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        warn!("Failed to parse capture_screen result as JSON: {}. Returning raw text.", e);
+                                                        raw_text_content.text
+                                                    }
+                                                }
+                                            } else {
+                                                raw_text_content.text
+                                            }
                                         }
-                                        RawContent::Image(_) => {
-                                            json!({"result": format!("Tool '{}' returned image content.", mcp_request.name)}).to_string()
-                                        }
-                                        RawContent::Resource(_) => {
-                                            json!({"result": format!("Tool '{}' returned resource content.", mcp_request.name)}).to_string()
-                                        }
+                                        _ => format!("Tool '{}' returned non-text content.", mcp_request.name),
                                     }
                                 }
-                                None => {
-                                    json!({"result": format!("Tool '{}' executed successfully but returned no content.", mcp_request.name)}).to_string()
-                                }
+                                None => format!("Tool '{}' executed successfully but returned no content.", mcp_request.name),
                             }
                         }
                         Err(e) => {
@@ -252,17 +299,18 @@ async fn main() -> Result<()> {
                         info!("OpenAI final response: {}",text);
                         println!("\nAssistant:\n{}",text);
                     }
-                    ChatCompletionRequestAssistantMessageContent::Array(parts) => { // Handle array content type
+                    ChatCompletionRequestAssistantMessageContent::Array(parts) => {
                         info!("OpenAI final response: [Multipart Content]");
-                        // Process parts if needed, e.g., extract text
                         let mut combined_text = String::new();
                         for part in parts {
-                             if let async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(text_part) = part {
+                             // *** Use correct import path for variants ***
+                             if let ChatCompletionRequestAssistantMessageContentPart::Text(text_part) = part {
                                  combined_text.push_str(&text_part.text);
-                                 combined_text.push('\n'); // Add separator if desired
-                             } else if let async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal_part) = part {
+                                 combined_text.push('\n');
+                             } else if let ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal_part) = part {
                                  combined_text.push_str(&format!("[Refusal Content]\n{refusal_part:?}"));
                              }
+                             // Note: Need to handle ImageUrl part if expecting it in assistant responses
                         }
                         println!("\nAssistant:\n{}", combined_text.trim());
                     }
@@ -281,6 +329,57 @@ async fn main() -> Result<()> {
 
     info!("Exiting AI Client.");
     Ok(())
+}
+
+// *** Updated function signature with generic C: Config ***
+async fn analyze_image_with_vision<C: Config>(
+    client: &OpenAIClient<C>, // Use Client<C>
+    prompt: String,
+    base64_image: &str,
+) -> Result<String> {
+    info!("Calling vision model '{}'...", OPENAI_VISION_MODEL);
+
+    let data_url = format!("data:image/png;base64,{}", base64_image);
+
+    // Create the request message with text and image parts
+    let request_message = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
+        content: ChatCompletionRequestUserMessageContent::Array(vec![
+            // Text part - Use correct type
+            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
+                text: prompt,
+            }),
+            // Image part - Use correct type
+            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(ChatCompletionRequestMessageContentPartImage {
+                image_url: ImageUrl {
+                    url: data_url,
+                    // *** Use ImageDetail instead of ImageUrlDetail ***
+                    detail: Some(ImageDetail::Auto), // Or High / Low
+                },
+            }),
+        ]),
+        name: None,
+    });
+
+    // Create the chat completion request for the vision model
+    let request = CreateChatCompletionRequest {
+        model: OPENAI_VISION_MODEL.to_string(),
+        messages: vec![request_message],
+        ..Default::default()
+    };
+
+    // Call the API
+    let response = client.chat().create(request).await.context("Vision API call failed")?;
+
+    // Extract the text response
+    if let Some(choice) = response.choices.into_iter().next() {
+        if let Some(content) = choice.message.content {
+            Ok(content)
+        } else {
+            Ok("Vision model returned no text content.".to_string())
+        }
+    } else {
+        Ok("Vision model returned no choices.".to_string())
+    }
 }
 
 
