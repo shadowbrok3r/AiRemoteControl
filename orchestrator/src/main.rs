@@ -331,7 +331,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// *** Updated function signature with generic C: Config ***
 async fn analyze_image_with_vision<C: Config>(
     client: &OpenAIClient<C>, // Use Client<C>
     prompt: String,
@@ -344,15 +343,12 @@ async fn analyze_image_with_vision<C: Config>(
     // Create the request message with text and image parts
     let request_message = ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
         content: ChatCompletionRequestUserMessageContent::Array(vec![
-            // Text part - Use correct type
             async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(ChatCompletionRequestMessageContentPartText {
                 text: prompt,
             }),
-            // Image part - Use correct type
             async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(ChatCompletionRequestMessageContentPartImage {
                 image_url: ImageUrl {
                     url: data_url,
-                    // *** Use ImageDetail instead of ImageUrlDetail ***
                     detail: Some(ImageDetail::Auto), // Or High / Low
                 },
             }),
@@ -367,8 +363,22 @@ async fn analyze_image_with_vision<C: Config>(
         ..Default::default()
     };
 
-    // Call the API
-    let response = client.chat().create(request).await.context("Vision API call failed")?;
+    // Call the API and log detailed errors
+    let response = client.chat().create(request).await
+        // *** Added detailed error logging using map_err ***
+        .map_err(|e| {
+            error!("Vision API call failed. Error details: {:?}", e);
+             match &e {
+                 OpenAIError::ApiError(api_error) => {
+                     error!("--> Specific Vision API Error: {:?}", api_error);
+                 }
+                 OpenAIError::Reqwest(req_err) => {
+                      error!("--> Specific Vision Network Error: {:?}", req_err);
+                 }
+                 _ => {} // Other error types already logged by the top-level error! macro
+             }
+            anyhow::anyhow!(e).context("Vision API call failed") // Convert to anyhow::Error
+        })?;
 
     // Extract the text response
     if let Some(choice) = response.choices.into_iter().next() {
@@ -381,7 +391,6 @@ async fn analyze_image_with_vision<C: Config>(
         Ok("Vision model returned no choices.".to_string())
     }
 }
-
 
 // Helper to manage conversation history size (remains the same)
 fn add_message_to_history(history: &mut VecDeque<ChatCompletionRequestMessage>, message: ChatCompletionRequestMessage) {

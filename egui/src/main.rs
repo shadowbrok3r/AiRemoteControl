@@ -1,7 +1,5 @@
 // Import anyhow macro
 use anyhow::{anyhow, Context}; use base64::Engine;
-// *** Add screenshots and base64 imports ***
-use screenshots::Screen;
 // *** Add display-info import ***
 use display_info::DisplayInfo;
 // *** Using enigo now ***
@@ -32,6 +30,7 @@ use rmcp::{serve_server, tool}; // Keep McpError for type alias if needed intern
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::io::Cursor;
 use std::process::Command;
 use tracing::{info, warn}; // Added warn
 use tracing_subscriber::EnvFilter; // Import EnvFilter for tracing setup
@@ -318,26 +317,29 @@ impl DesktopToolProvider {
         #[tool(aggr)] params: CaptureScreenParams
     ) -> Result<CallToolResult, ErrorData> {
         info!("Executing screen capture with params: {:?}", params);
-        let screens = Screen::all()
+        let screens =  xcap::Monitor::all()
             .context("Failed to get screen list")
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         let screen_to_capture = screens.first()
             .ok_or_else(|| anyhow!("No screen found to capture"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-        info!("Capturing from screen ID: {}", screen_to_capture.display_info.id);
+        info!("Capturing from screen ID: {:?}", screen_to_capture.id());
         let image = if let (Some(x), Some(y), Some(w), Some(h)) = (params.x, params.y, params.width, params.height) {
-             info!("Capturing region: x={}, y={}, width={}, height={}", x, y, w, h);
-             screen_to_capture.capture_area(x, y, w, h)
+             screen_to_capture
+                .capture_image()
                 .context("Failed to capture screen area")
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         } else {
              info!("Capturing full screen.");
-             screen_to_capture.capture()
+             screen_to_capture
+                .capture_image()
                 .context("Failed to capture full screen")
                 .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
         };
         info!("Capture successful ({}x{})", image.width(), image.height());
-        let base64_image = base64::engine::general_purpose::STANDARD.encode(image.as_raw());
+        let mut buf: Vec<u8> = Vec::new();
+        image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+        let base64_image = base64::engine::general_purpose::STANDARD.encode(&buf);
         info!("Encoded image to base64 (length: {})", base64_image.len());
         let result_json = json!({
             "status": "success", "format": "png", "width": image.width(), "height": image.height(), "base64_data": base64_image,
@@ -354,16 +356,16 @@ impl DesktopToolProvider {
         #[tool(aggr)] params: RunShellParams
     ) -> Result<CallToolResult, ErrorData> {
         info!("Received request to run command: {:?}", params);
-        let output = Command::new(&params.command)
+        let _ = Command::new(&params.command)
             .args(&params.args)
-            .output()
+            .spawn()
             .context(format!("Failed to execute command: {}", params.command))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-        info!( "Command '{}' executed. Status: {}, Stdout len: {}, Stderr len: {}", params.command, exit_code, stdout.len(), stderr.len());
-        let result_json = json!({ "status": if output.status.success() { "success" } else { "error" }, "exit_code": exit_code, "stdout": stdout, "stderr": stderr, });
+        // let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        // let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // let exit_code = output.status.code().unwrap_or(-1);
+        // info!( "Command '{}' executed. Status: {}, Stdout len: {}, Stderr len: {}", params.command, exit_code, stdout.len(), stderr.len());
+        let result_json = json!({ "status": "success"  }); // , "exit_code": exit_code, "stdout": stdout, "stderr": stderr,
         Ok(CallToolResult::success(vec![Content::json(result_json)
              .map_err(|e| anyhow!(e).context("Failed to serialize run_shell_command result"))
              .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
