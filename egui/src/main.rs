@@ -13,7 +13,7 @@ use tokio::time::{sleep, Duration};
 
 
 // --- Specific rmcp Imports ---
-use rmcp::{schemars, tool_box}; // For deriving schema
+use rmcp::schemars; // For deriving schema
 use rmcp::handler::server::ServerHandler;
 // use rmcp::transport::stdio;
 use tokio::net::TcpListener; // Added TcpListener
@@ -132,6 +132,11 @@ struct OpenAIWaitParams {
     duration_ms: Option<u64>,
 }
 
+#[derive(Deserialize, Debug, Serialize, schemars::JsonSchema)]
+struct FindWindowParams {
+    #[schemars(description = "The title (or part of the title) of the window to find. Case-insensitive search.")]
+    title_query: String,
+}
 
 // --- Tool Provider Implementation ---
 
@@ -141,9 +146,7 @@ struct DesktopToolProvider;
 // *** First impl block: Contains the tool definitions ***
 #[tool(tool_box)]// Apply tool_box here as well
 impl DesktopToolProvider {
-
     // --- Existing Custom Tools (Unchanged) ---
-
     #[tool(name = "get_screen_details", description = "Gets the primary screen resolution (width and height).")]
     async fn get_screen_details(
         &self,
@@ -154,31 +157,99 @@ impl DesktopToolProvider {
             .map_err(|e| anyhow!(e).context("display_info::DisplayInfo::all() failed"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
 
-        let primary = display_infos
-            .iter()
-            .find(|d| d.is_primary)
-            .or(display_infos.first());
+        let mut screens = vec![];
 
-        if let Some(primary_screen) = primary {
-            let result_json = json!({
-                "status": "success",
-                "width": primary_screen.width,
-                "height": primary_screen.height,
-                "scale_factor": primary_screen.scale_factor,
-                "x": primary_screen.x,
-                "y": primary_screen.y
-            });
-            Ok(CallToolResult::success(vec![Content::json(result_json)
-                .map_err(|e| anyhow!(e).context("Failed to serialize screen details to JSON"))
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
-            ]))
-        } else {
-            Err(ErrorData::new(
-                ErrorCode::INTERNAL_ERROR,
-                "Could not find primary or any display".to_string(),
-                None
-            ))
+        for screen in display_infos.iter() {
+            screens.push(
+                json!({
+                    "screen_id": screen.id,
+                    "name": screen.name,
+                    "width": screen.width,
+                    "height": screen.height,
+                    "scale_factor": screen.scale_factor,
+                    "x": screen.x,
+                    "y": screen.y
+                })
+            );
         }
+
+        Ok(CallToolResult::success(
+            vec![
+                Content::json(screens)
+                    .map_err(|e| anyhow!(e).context("Failed to serialize screen details to JSON"))
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+            ]
+        ))
+    }
+
+    #[tool(name = "find_window", description = "Finds the first non-minimized window whose title contains the given query string (case-insensitive) and returns its details.")]
+    async fn find_window(
+        &self,
+        #[tool(aggr)] params: FindWindowParams
+    ) -> Result<CallToolResult, ErrorData> {
+        info!("Executing find window with query: '{}'", params.title_query);
+
+        let windows = xcap::Window::all()
+            .context("Failed to get window list")
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
+        let query_lower = params.title_query.to_lowercase();
+
+        for window in windows {
+            // Skip minimized windows
+            let is_minimized = window.is_minimized()
+                .unwrap_or(true); // Treat error as minimized to skip
+            if is_minimized {
+                continue;
+            }
+
+            // Get window title
+            let title = match window.title() {
+                 Ok(t) => t,
+                 Err(_) => continue, // Skip windows where title cannot be retrieved
+            };
+
+            // Perform case-insensitive partial match
+            if title.to_lowercase().contains(&query_lower) {
+                let x = window.x().unwrap_or(0); // Provide default on error
+                let y = window.y().unwrap_or(0);
+                let width = window.width().unwrap_or(0);
+                let height = window.height().unwrap_or(0);
+                let app_name = window.app_name().unwrap_or_default(); // Get app name if available
+
+                info!("Found matching window: Title='{}', App='{}', Pos=({}, {}), Size=({}x{})", title, app_name, x, y, width, height);
+
+                let result_json = json!({
+                    "status": "success",
+                    "found": true,
+                    "title": title,
+                    "app_name": app_name,
+                    "x": x,
+                    "y": y,
+                    "width": width,
+                    "height": height,
+                    "is_maximized": window.is_maximized().unwrap_or(false) // Include maximized state
+                });
+
+                return Ok(CallToolResult::success(vec![Content::json(result_json)
+                    .map_err(|e| anyhow!(e).context("Failed to serialize find_window result"))
+                    .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+                ]));
+            }
+        }
+
+        // If no window was found after checking all
+        info!("No matching window found for query: '{}'", params.title_query);
+        Ok(CallToolResult::success(vec![Content::json(json!({
+            "status": "success", // Still a successful tool execution, just no result found
+            "found": false,
+            "message": format!("No non-minimized window found matching title query '{}'", params.title_query)
+        }))
+            .map_err(|e| anyhow!(e).context("Failed to serialize find_window 'not found' result"))
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
+        ]))
+        // Alternatively, you could return an error:
+        // Err(ErrorData::new(ErrorCode::NOT_FOUND, format!("No non-minimized window found matching title query '{}'", params.title_query), None))
     }
 
     #[tool(name = "move_mouse", description = "Moves the mouse cursor")]
@@ -324,18 +395,11 @@ impl DesktopToolProvider {
             .ok_or_else(|| anyhow!("No screen found to capture"))
             .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
         info!("Capturing from screen ID: {:?}", screen_to_capture.id());
-        let image = if let (Some(x), Some(y), Some(w), Some(h)) = (params.x, params.y, params.width, params.height) {
-             screen_to_capture
-                .capture_image()
-                .context("Failed to capture screen area")
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
-        } else {
-             info!("Capturing full screen.");
-             screen_to_capture
-                .capture_image()
-                .context("Failed to capture full screen")
-                .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?
-        };
+        let image = screen_to_capture
+            .capture_image()
+            .context("Failed to capture screen area")
+            .map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
+
         info!("Capture successful ({}x{})", image.width(), image.height());
         let mut buf: Vec<u8> = Vec::new();
         image.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).map_err(|e| ErrorData::new(ErrorCode::INTERNAL_ERROR, e.to_string(), None))?;
@@ -373,7 +437,6 @@ impl DesktopToolProvider {
     }
 
     // --- NEW Tools for OpenAI Computer Use Actions ---
-
     #[tool(name = "execute_openai_click", description = "Executes a mouse click action requested by the OpenAI Computer Use model.")]
     async fn execute_openai_click(
         &self,

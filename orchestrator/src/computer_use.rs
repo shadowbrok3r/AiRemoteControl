@@ -4,30 +4,32 @@ use openai_responses::{
     // Main client and request/response types
     types::{
         config::Truncation,
-        item::{ComputerAction, ComputerCallOutput, ComputerToolCall, SafetyCheck, ClickButton}, // Added ClickButton
-        request::{ContentItem, Input, Request}, // Removed ImageUrl (part of ContentItem)
-        response::{Response, OutputItem},
+        // Use SDK types based on list provided
+        // *** Corrected import path for OutputItem, added InputItem ***
+        item::{ClickButton, ComputerAction, ComputerCallOutput, ComputerToolCall, InputItem, OutputItem, SafetyCheck},
+        // *** Added InputListItem, removed unused ContentItem, ImageDetail ***
+        request::{Input, InputListItem, Request},
         tools::{Environment, Tool},
-        Model, // Removed Role (using string)
+        Model,
     },
     Client as ResponsesClient,
 };
 // Keep rmcp imports for server interaction
 use rmcp::{
-    model::{CallToolRequestParam, ErrorCode, ErrorData, RawContent},
-    service::{PeerSink, RoleClient, RunningService}, // Added PeerSink back (needed for helpers)
+    model::{CallToolRequestParam, RawContent}, // Removed ErrorCode, ErrorData
     serve_client,
+    // *** Use Peer directly, ServiceRole needed for generic bound ***
+    service::{RoleClient, RunningService},
+    Peer, // Use Peer type directly
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
-use std::{collections::VecDeque, env}; // Removed VecDeque if add_message_to_history is removed
+use serde_json::Value; // Removed json macro import
+// Removed std::env import
 use tokio::net::TcpSocket;
 use tracing::{debug, error, info, warn};
-// Removed async_openai import
 
 // Configuration
 const MCP_SERVER_ADDR: &str = "127.0.0.1:9001";
-const COMPUTER_USE_MODEL: &str = "computer-use-preview";
 const DISPLAY_WIDTH: u32 = 1920;
 const DISPLAY_HEIGHT: u32 = 1080;
 const ENVIRONMENT: Environment = Environment::Windows; // Use SDK Enum
@@ -47,8 +49,7 @@ struct ScreenshotResultData {
 #[derive(Debug, Serialize)] struct CaptureScreenParams { x: Option<i32>, y: Option<i32>, width: Option<u32>, height: Option<u32> }
 
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run_computer_use() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
@@ -91,23 +92,17 @@ async fn main() -> Result<()> {
     // Define the Computer Use tool for the request using SDK types
     // TODO: Verify Tool::ComputerUse variant name and fields
     let computer_tool = Tool::ComputerUse {
-        display_width: DISPLAY_WIDTH as u64, // Cast to u64
-        display_height: DISPLAY_HEIGHT as u64, // Cast to u64
+        display_width: DISPLAY_WIDTH as u64,
+        display_height: DISPLAY_HEIGHT as u64,
         environment: ENVIRONMENT,
-        // current_url: None, // Optional
     };
 
     // Construct the initial request using SDK types
     // TODO: Verify Model enum variant for computer-use-preview
-    // Using Gpt4o as a placeholder, assuming it might support it, or use Custom if available
     let initial_request = Request {
-        model: Model::ComputerUsePreview, // Placeholder - Verify correct model enum variant
-        // model: Model::Custom(COMPUTER_USE_MODEL.to_string()), // If Custom variant exists
-        // *** Use Input::UserMessage variant (guessing name) ***
-        input: vec![Input::UserMessage { // Assuming Input is an enum
-            role: "user".to_string(),
-            content: vec![ContentItem::Text { text: user_input.to_string() }],
-        }],
+        model: Model::ComputerUsePreview, // Assuming this variant exists
+        // *** Use Input::Text variant, wrapped in vec! ***
+        input: Input::Text(user_input.to_string()),
         tools: Some(vec![computer_tool.clone()]),
         instructions: None,
         previous_response_id: None,
@@ -118,19 +113,19 @@ async fn main() -> Result<()> {
 
     // --- Main Computer Use Loop ---
     let mut current_request = initial_request;
-    let mut last_response_id: Option<String> = None;
+    // Removed last_response_id, use response.id directly
 
     loop {
         debug!("Sending request...");
-        // *** Use ? to handle Result<Response, Error> ***
-        let response: Response = openai_client.create(current_request.clone()).await
-            .context("OpenAI Responses API call failed")?; // Use context before ?
+        // *** Removed type annotation, use ? directly ***
+        let response = openai_client.create(current_request.clone()).await
+            .context("OpenAI Responses API call failed")?
+            .unwrap();
         // info!("Received response: {:?}", response);
 
-        last_response_id = response.id.clone();
+        let current_response_id = response.id.clone();
 
         // Find the computer_call action in the response output
-        // *** Use OutputItem::ComputerToolCall variant ***
         let computer_call_opt: Option<&ComputerToolCall> = response.output.iter().find_map(|item| {
             if let OutputItem::ComputerToolCall(call) = item { Some(call) } else { None }
         });
@@ -144,21 +139,18 @@ async fn main() -> Result<()> {
             // --- Execute Action using MCP Server ---
             let execution_result = match action {
                 ComputerAction::Click { x, y, button } => {
-                    // *** Match on button enum, don't use .to_string() ***
                     let button_str = match button {
-                         ClickButton::Left => "left",
-                         ClickButton::Right => "right",
-                         ClickButton::Middle => "middle",
-                         // Add other variants if present in SDK's ClickButton enum
-                         // _ => return Err(anyhow!("Unsupported ClickButton variant received from SDK"))
+                         ClickButton::Left=>"left",
+                         ClickButton::Right=>"right",
+                         ClickButton::Wheel=> "middle",
+                         ClickButton::Back => "back",
+                         ClickButton::Forward => "forward",
                     }.to_string();
-                    // *** Remove dereference from x, y (assuming they are u64/f64) ***
-                    let params = OpenAIClickParams { x: *x as i32, y: *y as i32, button: button_str }; // Cast u64/f64 to i32 if needed
+                    let params = OpenAIClickParams { x: x.to_owned() as i32, y: y.to_owned() as i32, button: button_str };
                     call_mcp_tool(&mcp_peer, "execute_openai_click", params).await
                 }
                 ComputerAction::Scroll { x, y, scroll_x, scroll_y } => {
-                     // *** Remove dereference from x, y, scroll_x, scroll_y ***
-                    let params = OpenAIScrollParams { x: *x as i32, y: *y as i32, scroll_x: *scroll_x as i32, scroll_y: *scroll_y as i32 }; // Cast
+                    let params = OpenAIScrollParams { x: x.to_owned() as i32, y: y.to_owned() as i32, scroll_x: scroll_x.to_owned() as i32, scroll_y: scroll_y.to_owned() as i32 };
                     call_mcp_tool(&mcp_peer, "execute_openai_scroll", params).await
                 }
                 ComputerAction::KeyPress { keys } => {
@@ -169,15 +161,28 @@ async fn main() -> Result<()> {
                     let params = OpenAITypeParams { text: text.clone() };
                     call_mcp_tool(&mcp_peer, "execute_openai_type", params).await
                 }
-                 // *** Match Wait variant payload correctly ***
-                 ComputerAction::Wait { duration } => { // Assuming field name is duration
-                    let params = OpenAIWaitParams { duration_ms: Some(*duration) }; // Use Option<u64>
+                 ComputerAction::Wait => {
+                    let params = OpenAIWaitParams { duration_ms: None };
                     call_mcp_tool(&mcp_peer, "execute_openai_wait", params).await
                  }
-                _ => {
-                     warn!("Received unknown or unhandled action type: {:?}", action);
-                     Err(anyhow!("Unknown or unhandled action type received: {:?}", action))
-                }
+                 ComputerAction::Screenshot => {
+                     info!("Received Screenshot action (handled implicitly).");
+                     Ok(())
+                 }
+                 ComputerAction::Move { x, y } => {
+                     warn!("Received Move action. Mapping to execute_openai_click at ({}, {}) with no button press.", x, y);
+                     let params = OpenAIClickParams { x: x.to_owned() as i32, y: y.to_owned() as i32, button: "none".to_string() };
+                     call_mcp_tool(&mcp_peer, "execute_openai_click", params).await
+                 }
+                 ComputerAction::DoubleClick { x, y } => {
+                    warn!("Received DoubleClick action. Mapping to single left click for now.");
+                    let params = OpenAIClickParams { x: x.to_owned() as i32, y: y.to_owned() as i32, button: "left".to_string() };
+                    call_mcp_tool(&mcp_peer, "execute_openai_click", params).await
+                 }
+                 ComputerAction::Drag { .. } => {
+                     warn!("Received Drag action, which is not implemented yet.");
+                     Ok(())
+                 }
             };
 
             if let Err(e) = execution_result {
@@ -205,46 +210,34 @@ async fn main() -> Result<()> {
                 Some(computer_call.pending_safety_checks.clone())
             };
 
-            // Construct the output Input item using SDK types
-            // TODO: Verify the exact structure for ComputerCallOutput and its nested 'output' field
-            let output_content = ContentItem::ImageUrl { // Guessing ContentItem::ImageUrl is used here
-                 image_url: openai_responses::types::request::ImageUrl { // Use SDK's ImageUrl struct
-                    url: format!("data:image/png;base64,{}", screenshot_base64),
-                    detail: None, // Detail might not apply here, or use ImageDetail::Auto
-                 }
+            // 1. Construct the ComputerCallOutput enum variant (Screenshot)
+            let output_enum_variant = ComputerCallOutput::Screenshot {
+                file_id: None,
+                image_url: Some(format!("data:image/png;base64,{}", screenshot_base64)),
             };
 
-            // TODO: Verify the exact structure for ComputerCallOutput's 'output' field.
-            // The user-provided struct had `output: ComputerCallOutput`, which seemed recursive.
-            // The OpenAI JSON shows `output: { type: "input_image", image_url: "..." }`
-            // Let's assume the SDK expects a `Value` or specific struct here. Using Value for now.
-            let output_payload: Value = serde_json::to_value(output_content)
-                .context("Failed to serialize screenshot ContentItem")?;
-
-            let output_item = ComputerCallOutput {
+            // 2. Construct the ComputerToolCallOutput struct
+            let output_struct = openai_responses::types::item::ComputerToolCallOutput {
+                id: None,
+                status: None,
                 call_id: call_id.clone(),
+                output: output_enum_variant,
                 acknowledged_safety_checks,
-                output: output_payload, // Assign the Value, verify SDK type!
             };
 
-            // Prepare the next request using Input::ComputerCallOutput variant (guessing name)
-            // TODO: Verify the correct Input enum variant for sending tool output
-             let next_input = Input::ComputerCallOutput { // Assuming Input is an enum with this variant
-                 call_id: call_id, // Pass call_id here
-                 output: output_item, // Pass the constructed output item
-                 // Remove redundant/incorrect fields based on enum variant definition
-                 // r#type: "computer_call_output".to_string(),
-                 // role: "".to_string(),
-                 // content: vec![],
-                 // acknowledged_safety_checks: None,
-             };
+            // 3. Construct the InputListItem enum variant containing the struct
+            // *** Use correct variant InputItem::ComputerToolCallOutput ***
+            let next_input_list_item = InputListItem::Item(InputItem::ComputerToolCallOutput(output_struct)); // Wrap struct in Item variant
 
+            // 4. Construct the Input enum variant containing the list item
+            let next_input_vec = Input::List(vec![next_input_list_item]); // Use Input::List, wrap in outer Vec
+
+            // 5. Construct the final Request
             current_request = Request {
-                // TODO: Verify Model enum variant for computer-use-preview
-                model: Model::Gpt4o, // Placeholder
-                input: vec![next_input],
+                model: Model::ComputerUsePreview, // Assuming this variant exists
+                input: next_input_vec, // Assign the Vec<Input>
                 tools: Some(vec![computer_tool.clone()]),
-                previous_response_id: last_response_id.clone(),
+                previous_response_id: Some(current_response_id),
                 truncation: Some(Truncation::Auto),
                 ..Default::default()
             };
@@ -258,18 +251,16 @@ async fn main() -> Result<()> {
             // Parse final text output from response.output
             for item in response.output {
                  match item {
-                     // *** Check actual variant name for text output ***
-                     OutputItem::Text(text_item) => { // Assuming OutputItem::Text variant exists
-                         println!("{}", text_item.text.unwrap_or_default()); // Assuming text field exists
+                     // TODO: Verify actual variant name for text output (e.g., Message, TextData?)
+                     OutputItem::Message(msg_item) => { // Guessing variant name
+                        // TODO: Verify structure of msg_item and how to get text
+                         println!("Message: {:?}", msg_item);
                      }
-                      // *** Check actual variant name for reasoning ***
                      OutputItem::Reasoning(reasoning_item) => {
-                         // *** Handle Option for summary ***
-                         if let Some(summary_vec) = reasoning_item.summary {
-                             for summary_item in summary_vec {
-                                 // TODO: Check actual structure of ReasoningSummary type
-                                 println!("Reasoning: {:?}", summary_item);
-                             }
+                         // summary is Vec<ReasoningSummary>, not Option
+                         for summary_item in reasoning_item.summary {
+                             // TODO: Check actual structure of ReasoningSummary type
+                             println!("Reasoning: {:?}", summary_item);
                          }
                      }
                      _ => {}
@@ -285,7 +276,8 @@ async fn main() -> Result<()> {
 }
 
 // Helper function to call an MCP tool and handle potential errors
-async fn call_mcp_tool<P: Serialize + std::fmt::Debug>(mcp_peer: &PeerSink, tool_name: &str, params: P) -> Result<()> {
+// *** Updated signature to take Peer<RoleClient> ***
+async fn call_mcp_tool<P: Serialize + std::fmt::Debug>(mcp_peer: &Peer<RoleClient>, tool_name: &str, params: P) -> Result<()> {
     info!("Calling MCP tool '{}' with params: {:?}", tool_name, params);
     let arguments = serde_json::to_value(params).context("Failed to serialize MCP tool parameters")?;
     let arguments_map = match arguments {
@@ -294,18 +286,21 @@ async fn call_mcp_tool<P: Serialize + std::fmt::Debug>(mcp_peer: &PeerSink, tool
         _ => return Err(anyhow!("MCP tool parameters did not serialize to a JSON object or null")),
     };
     let mcp_request = CallToolRequestParam { name: tool_name.to_string().into(), arguments: arguments_map, };
+    // *** Use mcp_peer.call_tool directly ***
     mcp_peer.call_tool(mcp_request).await.context(format!("MCP tool call '{}' failed", tool_name))?;
     Ok(())
 }
 
 // Helper function to call capture_screen and extract base64 data
+// *** Updated signature to take Peer<RoleClient> ***
 async fn call_capture_screen(
-    mcp_peer: &PeerSink,
+    mcp_peer: &Peer<RoleClient>,
     x: Option<i32>, y: Option<i32>, width: Option<u32>, height: Option<u32>
 ) -> Result<String> {
     let params = CaptureScreenParams { x, y, width, height };
+    // *** Pass mcp_peer directly ***
     let mcp_result = call_mcp_tool_with_result(mcp_peer, "capture_screen", params).await?;
-    match mcp_result.content.into_iter().next() { // *** Use .content ***
+    match mcp_result.content.into_iter().next() {
         Some(content) => match content.raw {
             RawContent::Text(raw_text) => {
                 match serde_json::from_str::<ScreenshotResultData>(&raw_text.text) {
@@ -320,8 +315,9 @@ async fn call_capture_screen(
 }
 
 // Helper to call MCP tool and get Result
+// *** Updated signature to take Peer<RoleClient> ***
 async fn call_mcp_tool_with_result<P: Serialize + std::fmt::Debug>(
-    mcp_peer: &PeerSink,
+    mcp_peer: &Peer<RoleClient>,
     tool_name: &str,
     params: P
 ) -> Result<rmcp::model::CallToolResult> {
@@ -333,7 +329,8 @@ async fn call_mcp_tool_with_result<P: Serialize + std::fmt::Debug>(
         _ => return Err(anyhow!("MCP tool parameters did not serialize to a JSON object or null")),
     };
     let mcp_request = CallToolRequestParam { name: tool_name.to_string().into(), arguments: arguments_map, };
+    // *** Use mcp_peer.call_tool directly ***
     mcp_peer.call_tool(mcp_request).await.context(format!("MCP tool call '{}' failed", tool_name))
 }
 
-// Removed add_message_to_history function and MAX_CONVERSATION_DEPTH constant
+// Removed add_message_to_history function

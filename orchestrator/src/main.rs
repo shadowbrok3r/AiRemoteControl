@@ -3,11 +3,11 @@ use async_openai::{
     config::Config, // *** Added Config import ***
     error::OpenAIError, // *** Added OpenAIError import ***
     types::{
-        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent, 
-        ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage, 
-        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent, 
-        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage, 
-        ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption, 
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
+        ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption,
         ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject, ImageDetail, ImageUrl, Role // *** Changed ImageUrlDetail to ImageDetail ***
     },
     Client as OpenAIClient, // Alias for Client<C>
@@ -21,19 +21,28 @@ use rmcp::{
 use serde_json::{json, Map, Value}; // Added Map
 use std::{collections::VecDeque, env};
 use tokio::net::TcpSocket; // Use TcpSocket for connecting
-use tracing::{debug, error, info, warn};
+use tracing::{info, error, debug, warn};
 
 pub mod computer_use;
 
 // Configuration
 const MCP_SERVER_ADDR: &str = "127.0.0.1:9001"; // Address of your TCP MCP Server
-const MAX_CONVERSATION_DEPTH: usize = 15;
+const MAX_CONVERSATION_DEPTH: usize = 15; // Max history items (including System prompt)
 const OPENAI_CHAT_MODEL: &str = "gpt-4.1-mini"; // Or your preferred model like gpt-4o-mini if desired
 // *** Added Vision Model constant ***
 const OPENAI_VISION_MODEL: &str = "gpt-4.1-nano"; // Specific model for image analysis
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // i have to wait for the computer-use-model to become available. it is only allowed for 'select' devs
+    // computer_use::run_computer_use().await?;
+    run_gpt_computer_use().await?;
+    info!("Exiting AI Client.");
+    Ok(())
+}
+
+async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
@@ -86,6 +95,7 @@ async fn main() -> Result<()> {
                 }
             };
 
+
             ChatCompletionTool {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
@@ -108,13 +118,15 @@ async fn main() -> Result<()> {
     // --- Main Interaction Loop ---
     let mut conversation_history: VecDeque<ChatCompletionRequestMessage> = VecDeque::new();
     let system_prompt = "You are a helpful AI assistant. You can control the user's desktop using the available tools. Analyze the user's request and use the tools provided to fulfill it step-by-step. Ask for clarification if the request is ambiguous. Inform the user upon successful completion or if an error occurs. When asked to analyze a screen capture, use the textual description provided as the result of the 'capture_screen' tool.".to_string();
+
+    // Add initial system message
     conversation_history.push_back(ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage{
-        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt),
+        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()), // Clone system prompt text
         name: None
     }));
 
 
-    loop {
+    loop { // Outer loop (user input)
         // Get user input
         println!("\nEnter your request (or type 'quit'):");
         let mut user_input = String::new();
@@ -122,13 +134,14 @@ async fn main() -> Result<()> {
         let user_input = user_input.trim();
 
         if user_input.eq_ignore_ascii_case("quit") {
-            break;
+            return Ok(());
         }
         if user_input.is_empty() {
             continue;
         }
 
-        add_message_to_history(&mut conversation_history, ChatCompletionRequestMessage::User(
+        // Add User message directly
+        conversation_history.push_back(ChatCompletionRequestMessage::User(
             ChatCompletionRequestUserMessage {
                 content: ChatCompletionRequestUserMessageContent::Text(user_input.to_string()),
                 name: None,
@@ -136,13 +149,55 @@ async fn main() -> Result<()> {
         ));
 
         // --- Call OpenAI Loop (Handles potential multi-step tool calls) ---
-        loop {
+        loop { // Inner loop (OpenAI calls)
+
+            // --- Trim History ---
+            // Keep the system prompt (index 0) and trim older messages from index 1 if history exceeds max depth
+            while conversation_history.len() > MAX_CONVERSATION_DEPTH {
+                if conversation_history.len() >= 2 { // Ensure System prompt + one other exists
+                    info!("Trimming history: Removing message at index 1. Current length: {}", conversation_history.len());
+                    // *** Add logging to see what's being removed ***
+                    let removed_message_role = match conversation_history.get(1) {
+                        Some(ChatCompletionRequestMessage::User(_)) => "User",
+                        Some(ChatCompletionRequestMessage::Assistant(_)) => "Assistant",
+                        Some(ChatCompletionRequestMessage::Tool(_)) => "Tool",
+                        Some(ChatCompletionRequestMessage::System(_)) => "System (Error!)", // Should not happen
+                        Some(ChatCompletionRequestMessage::Function(_)) => "Function (Error!)", // Should not happen
+                        Some(ChatCompletionRequestMessage::Developer(_)) => "Developer (Error!)", // Should not happen
+                        None => "None (Error!)",
+                   };
+
+                   info!(
+                        "Trimming history: Removing message at index 1 (Role: {}). Current length: {}",
+                        removed_message_role,
+                        conversation_history.len()
+                    );
+                    conversation_history.remove(1); // Remove oldest non-system message
+                } else {
+                    warn!("Attempted to trim history below 2 messages. Breaking trim loop.");
+                    break; // Should not happen if MAX_DEPTH >= 1
+                }
+            }
+            // --- End Trim History ---
+
+            // *** Defensive Check ***
+            if conversation_history.len() >= 2 {
+                if let Some(ChatCompletionRequestMessage::Tool(_)) = conversation_history.get(1) {
+                        // This should NOT happen with the current logic if VecDeque::remove(1) works as expected.
+                        error!("CRITICAL: History state invalid after trimming! Message at index 1 is Tool.");
+                        debug!("Invalid History State: {:?}", conversation_history);
+                        // Handle this critical error, maybe break or return?
+                        println!("Internal error: Invalid conversation history state detected. Please report this.");
+                        break; // Break inner loop
+                }
+            }
+
             info!("Sending request to OpenAI chat model...");
-            debug!("Conversation History: {:?}", conversation_history);
+            info!("Conversation History (len={}): {:?}", conversation_history.len(), conversation_history); // Log length and content
 
             let request = CreateChatCompletionRequest {
                 model: OPENAI_CHAT_MODEL.to_string(),
-                messages: conversation_history.iter().cloned().collect(),
+                messages: conversation_history.iter().cloned().collect(), // Use current trimmed history
                 tools: if openai_tools.is_empty() { None } else { Some(openai_tools.clone()) },
                 tool_choice: if openai_tools.is_empty() { None } else { Some(ChatCompletionToolChoiceOption::Auto) },
                 ..Default::default()
@@ -155,10 +210,10 @@ async fn main() -> Result<()> {
                      error!("OpenAI API error: {}", e);
                      match e {
                          OpenAIError::ApiError(api_error) => {
-                             error!("OpenAI API Error Details: {:?}", api_error);
-                             if let Some(code) = &api_error.code {
-                                 println!("OpenAI Error Code: {}", code);
-                             }
+                              error!("OpenAI API Error Details: {:?}", api_error);
+                              if let Some(code) = &api_error.code {
+                                   println!("OpenAI Error Code: {}", code);
+                              }
                          }
                          OpenAIError::Reqwest(req_err) => {
                               error!("Network Error Details: {:?}", req_err);
@@ -169,8 +224,9 @@ async fn main() -> Result<()> {
                          }
                      }
                      println!("Error communicating with OpenAI. Please check logs and API key/quota. Try again.");
-                     conversation_history.pop_back(); // Allow retry
-                     break; // Break inner loop
+                     // Don't pop the user message if the API call fails, allow user to retry or quit
+                     // conversation_history.pop_back(); // Removed this line
+                     break; // Break inner loop, go back to waiting for user input
                  }
             };
 
@@ -184,15 +240,18 @@ async fn main() -> Result<()> {
                  }
             };
 
+            // Construct the assistant message based on the response choice
             let assistant_message_request = ChatCompletionRequestAssistantMessage {
                 content: choice.message.content.clone().map(ChatCompletionRequestAssistantMessageContent::Text),
                 name: None,
                 tool_calls: choice.message.tool_calls.clone(),
-                function_call: choice.message.function_call.clone(),
-                audio: None,
-                refusal: None,
+                function_call: choice.message.function_call.clone(), // Keep for older models if needed
+                audio: None, // Assuming no audio response for now
+                refusal: None, // Assuming no refusal content for now
             };
-            add_message_to_history(&mut conversation_history, ChatCompletionRequestMessage::Assistant(assistant_message_request.clone()));
+
+            // Add Assistant message directly
+            conversation_history.push_back(ChatCompletionRequestMessage::Assistant(assistant_message_request.clone()));
 
 
             // --- Handle Tool Calls ---
@@ -210,19 +269,21 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             error!("Failed to parse arguments JSON string for tool '{}': {} (Args: '{}')", tool_name, e, arguments_str);
                             let error_msg = format!("Invalid JSON arguments provided by AI for tool '{}': {}", tool_name, e);
-                            add_message_to_history(&mut conversation_history, ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
+                            // Add Tool message with error directly
+                            conversation_history.push_back(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
                                 tool_call_id: call_id,
                                 content: ChatCompletionRequestToolMessageContent::Text(error_msg)
                             }));
-                            continue; // Skip this tool call
+                            continue; // Skip this tool call, proceed to next tool call or next API iteration
                         }
                     };
 
+                    // Ensure arguments are a JSON object for MCP
                     let arguments_map: Option<Map<String, Value>> = match arguments_value {
                         Value::Object(map) => Some(map),
                         _ => {
                             warn!("Tool arguments were not a JSON object for tool '{}'. Treating as empty.", tool_name);
-                            None
+                            None // Send None if not an object
                         }
                     };
 
@@ -242,6 +303,7 @@ async fn main() -> Result<()> {
                                 Some(content) => {
                                     match content.raw {
                                         RawContent::Text(raw_text_content) => {
+                                            // Special handling for screen capture analysis
                                             if mcp_request.name == "capture_screen" {
                                                 info!("Received screen capture result, attempting analysis...");
                                                 match serde_json::from_str::<Value>(&raw_text_content.text) {
@@ -260,16 +322,16 @@ async fn main() -> Result<()> {
                                                             }
                                                         } else {
                                                             warn!("capture_screen result JSON did not contain 'base64_data' string.");
-                                                            raw_text_content.text
+                                                            raw_text_content.text // Return raw JSON if no base64 data
                                                         }
                                                     }
                                                     Err(e) => {
                                                         warn!("Failed to parse capture_screen result as JSON: {}. Returning raw text.", e);
-                                                        raw_text_content.text
+                                                        raw_text_content.text // Return raw text if JSON parsing fails
                                                     }
                                                 }
                                             } else {
-                                                raw_text_content.text
+                                                raw_text_content.text // Return text for other tools
                                             }
                                         }
                                         _ => format!("Tool '{}' returned non-text content.", mcp_request.name),
@@ -280,19 +342,22 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             error!("Failed to call MCP tool '{}': {}", mcp_request.name, e);
+                            // Return error as JSON string for OpenAI
                             json!({
-                                "error": format!("Failed to execute tool '{}' via MCP: {}", mcp_request.name, e)
+                                "status": "error",
+                                "message": format!("Failed to execute tool '{}' via MCP: {}", mcp_request.name, e)
                             }).to_string()
                         }
                     };
 
 
-                    add_message_to_history(&mut conversation_history, ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
+                    // Add Tool message with result/error directly
+                    conversation_history.push_back(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
                         tool_call_id: call_id,
                         content: ChatCompletionRequestToolMessageContent::Text(tool_result_content_str)
                     }));
                 }
-                continue; // Continue the inner OpenAI loop
+                continue; // Continue the inner OpenAI loop to send tool results back
 
             } else if let Some(content) = assistant_message_request.content {
                 // --- Handle Regular Assistant Message ---
@@ -305,20 +370,20 @@ async fn main() -> Result<()> {
                         info!("OpenAI final response: [Multipart Content]");
                         let mut combined_text = String::new();
                         for part in parts {
-                             // *** Use correct import path for variants ***
-                             if let ChatCompletionRequestAssistantMessageContentPart::Text(text_part) = part {
-                                 combined_text.push_str(&text_part.text);
-                                 combined_text.push('\n');
-                             } else if let ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal_part) = part {
-                                 combined_text.push_str(&format!("[Refusal Content]\n{refusal_part:?}"));
-                             }
-                             // Note: Need to handle ImageUrl part if expecting it in assistant responses
+                            // *** Use correct import path for variants ***
+                            if let ChatCompletionRequestAssistantMessageContentPart::Text(text_part) = part {
+                                combined_text.push_str(&text_part.text);
+                                combined_text.push('\n');
+                            } else if let ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal_part) = part {
+                                combined_text.push_str(&format!("[Refusal Content]\n{refusal_part:?}"));
+                            }
+                            // Note: Need to handle ImageUrl part if expecting it in assistant responses
                         }
                         println!("\nAssistant:\n{}", combined_text.trim());
                     }
                 }
 
-                break; // Break inner loop
+                break; // Break inner loop, assistant gave final answer, wait for next user input
 
             } else {
                  warn!("OpenAI response had neither content nor tool calls.");
@@ -328,11 +393,9 @@ async fn main() -> Result<()> {
         } // End inner OpenAI loop
 
     } // End main user input loop
-
-    info!("Exiting AI Client.");
-    Ok(())
 }
 
+// Vision analysis function (remains the same)
 async fn analyze_image_with_vision<C: Config>(
     client: &OpenAIClient<C>, // Use Client<C>
     prompt: String,
@@ -362,6 +425,7 @@ async fn analyze_image_with_vision<C: Config>(
     let request = CreateChatCompletionRequest {
         model: OPENAI_VISION_MODEL.to_string(),
         messages: vec![request_message],
+        max_tokens: Some(1024), // Add max_tokens for vision model
         ..Default::default()
     };
 
@@ -372,10 +436,10 @@ async fn analyze_image_with_vision<C: Config>(
             error!("Vision API call failed. Error details: {:?}", e);
              match &e {
                  OpenAIError::ApiError(api_error) => {
-                     error!("--> Specific Vision API Error: {:?}", api_error);
+                      error!("--> Specific Vision API Error: {:?}", api_error);
                  }
                  OpenAIError::Reqwest(req_err) => {
-                      error!("--> Specific Vision Network Error: {:?}", req_err);
+                       error!("--> Specific Vision Network Error: {:?}", req_err);
                  }
                  _ => {} // Other error types already logged by the top-level error! macro
              }
@@ -394,30 +458,4 @@ async fn analyze_image_with_vision<C: Config>(
     }
 }
 
-// Helper to manage conversation history size (remains the same)
-fn add_message_to_history(history: &mut VecDeque<ChatCompletionRequestMessage>, message: ChatCompletionRequestMessage) {
-     history.push_back(message);
-     while history.len() > MAX_CONVERSATION_DEPTH {
-         let role_at_index_1 = match history.get(1) {
-             Some(ChatCompletionRequestMessage::System(_)) => Some(Role::System),
-             Some(ChatCompletionRequestMessage::User(_)) => Some(Role::User),
-             Some(ChatCompletionRequestMessage::Assistant(_)) => Some(Role::Assistant),
-             Some(ChatCompletionRequestMessage::Tool(_)) => Some(Role::Tool),
-             _ => None,
-         };
-
-         if history.len() > 1 && role_at_index_1 != Some(Role::System) {
-             history.remove(1);
-         } else {
-             let role_at_front = match history.front() {
-                 Some(ChatCompletionRequestMessage::System(_)) => Some(Role::System),
-                 _ => None,
-             };
-             if role_at_front != Some(Role::System) {
-                 history.pop_front();
-             } else {
-                 break;
-             }
-         }
-     }
-}
+// Removed the add_message_to_history function

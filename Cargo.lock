@@ -2595,6 +2595,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "macon"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e2360fdc60235ad3db2d65bb74539e0813c20a626f7e330ce9a64b2d4e513f0"
+dependencies = [
+ "macon_api",
+ "macon_derive",
+]
+
+[[package]]
+name = "macon_api"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2330ee9375fc537d78cc438ed16695a5d0201f0be9d977bf6bc4ac11e5b4e177"
+
+[[package]]
+name = "macon_derive"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccd7e1436ba066ad10c8b43ac4a00d304322831b90f039f1d83815f846fee024"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "malloc_buf"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3345,13 +3372,14 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 
 [[package]]
 name = "openai_responses"
-version = "0.1.3"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b726aa57e0a7f76e905f85a3c42536f34857239967856ea09b70d83874f41969"
+checksum = "8a332e91c79b1c199e54c7c295029d5bed8a609276783c2eddc464fa1795bb27"
 dependencies = [
  "async-fn-stream",
  "chrono",
  "futures",
+ "macon",
  "reqwest",
  "reqwest-eventsource",
  "serde",
