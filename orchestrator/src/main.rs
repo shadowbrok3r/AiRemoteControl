@@ -1,27 +1,30 @@
-use anyhow::{Context, Result}; // Added anyhow for bail macro
+use anyhow::{Context, Result};
 use async_openai::{
-    config::Config, // *** Added Config import ***
-    error::OpenAIError, // *** Added OpenAIError import ***
+    config::Config,
+    error::OpenAIError,
     types::{
         ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageContent,
-        ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessage, ChatCompletionRequestMessageContentPartImage,
         ChatCompletionRequestMessageContentPartText, ChatCompletionRequestSystemMessage, ChatCompletionRequestSystemMessageContent,
         ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessage,
         ChatCompletionRequestUserMessageContent, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject, ImageDetail, ImageUrl, Role // *** Changed ImageUrlDetail to ImageDetail ***
+        ChatCompletionToolType, CreateChatCompletionRequest, FunctionObject, ImageDetail, ImageUrl
     },
-    Client as OpenAIClient, // Alias for Client<C>
+    Client as OpenAIClient,
 };
 use rmcp::{
-    // Added ListToolsRequest, RawContent. Removed Content, Tool alias.
-    model::{CallToolRequestParam, RawContent}, // Removed ListToolsRequest import error, use None below
-    service::{RoleClient, RunningService}, // RoleClient likely needs feature flag
-    serve_client, // serve_client likely needs feature flag
+    model::{CallToolRequestParam, RawContent}, 
+    service::{RoleClient, RunningService},
+    serve_client,
 };
-use serde_json::{json, Map, Value}; // Added Map
+use serde_json::{json, Map, Value};
 use std::{collections::VecDeque, env};
-use tokio::net::TcpSocket; // Use TcpSocket for connecting
+use tokio::net::TcpSocket; 
 use tracing::{info, error, debug, warn};
+use futures::stream::StreamExt;
+use futures::future::join_all;
+use tokio::task::JoinHandle;
+use std::collections::HashMap;
 
 pub mod computer_use;
 
@@ -29,8 +32,18 @@ pub mod computer_use;
 const MCP_SERVER_ADDR: &str = "127.0.0.1:9001"; // Address of your TCP MCP Server
 const MAX_CONVERSATION_DEPTH: usize = 15; // Max history items (including System prompt)
 const OPENAI_CHAT_MODEL: &str = "gpt-4.1-mini"; // Or your preferred model like gpt-4o-mini if desired
-// *** Added Vision Model constant ***
 const OPENAI_VISION_MODEL: &str = "gpt-4.1-nano"; // Specific model for image analysis
+// const OPENAI_CHAT_MODEL: &str = "gemini-2.0-flash"; // Or your preferred model like gpt-4o-mini if desired
+// const OPENAI_VISION_MODEL: &str = "gemini-2.0-flash"; // Specific model for image analysis
+
+#[derive(Debug, Clone, Default)]
+struct PartialToolCall {
+    index: Option<usize>,
+    id: Option<String>,
+    name: Option<String>,
+    /// Accumulate argument chunks
+    arguments: String,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -54,7 +67,15 @@ async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
     dotenv::dotenv().ok();
     if env::var("OPENAI_API_KEY").is_err() {
         anyhow::bail!("OPENAI_API_KEY environment variable not set.");
-    }
+    } 
+
+    // let gemini_key = dotenv::env::var("GEMINI_KEY").unwrap();
+
+    // let c = OpenAIConfig::new()
+    //     .with_api_base("https://generativelanguage.googleapis.com/v1beta/openai/")
+    //     .with_api_key("");
+
+    // let openai_client = OpenAIClient::with_config(c);
     let openai_client = OpenAIClient::new();
 
     // --- Connect to MCP Server ---
@@ -77,7 +98,7 @@ async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
         .list_tools(None) // Use None for default options
         .await
         .context("Failed to list tools from MCP server")?;
-    info!("Available tools: {:?}", mcp_tools_result.tools.iter().map(|t| &t.name).collect::<Vec<_>>());
+    info!("Available tools: {:#?}", mcp_tools_result.tools.iter().map(|t| &t.name).collect::<Vec<_>>());
 
     // Convert MCP tools to OpenAI tool format
     let openai_tools: Vec<ChatCompletionTool> = mcp_tools_result
@@ -117,11 +138,44 @@ async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
 
     // --- Main Interaction Loop ---
     let mut conversation_history: VecDeque<ChatCompletionRequestMessage> = VecDeque::new();
-    let system_prompt = "You are a helpful AI assistant. You can control the user's desktop using the available tools. Analyze the user's request and use the tools provided to fulfill it step-by-step. Ask for clarification if the request is ambiguous. Inform the user upon successful completion or if an error occurs. When asked to analyze a screen capture, use the textual description provided as the result of the 'capture_screen' tool.".to_string();
+    let system_prompt = r#"You are a helpful AI assistant designed to control the user's desktop via function calls.
+
+    **Core Functionality:**
+    * Analyze user requests carefully.
+    * Break down complex tasks (like finding a window, typing in it, and then moving it) into a sequence of individual tool calls.
+    * Use the available tools step-by-step to fulfill the request.
+    * Execute tools sequentially unless the user explicitly asks for parallel actions *and* the actions are independent.
+
+    **Tool Usage Guidelines:**
+    * **`find_window`**: Use this first to locate a window by its title before interacting with it. Note the returned coordinates (x, y) and dimensions.
+    * **`move_mouse`**: Moves the cursor to absolute or relative coordinates.
+    * **`mouse_action`**: Performs clicks, presses, or releases.
+        * **Click:** `button: "Left", click_type: "Click"` (or omit `click_type`).
+        * **Press & Hold:** `button: "Left", click_type: "Press"`.
+        * **Release:** `button: "Left", click_type: "Release"`.
+    * **`keyboard_action`**: Types text or simulates key presses (like Enter, Ctrl+C).
+    * **`run_shell_command`**: Executes commands like opening applications (e.g., `command: "notepad"`).
+    * **`capture_screen`**: Captures the screen. Use the resulting text description (which includes vision model analysis) for subsequent analysis or actions. Do not attempt to interpret the base64 data directly.
+
+    **Complex Actions (Example: Dragging a Window):**
+    1.  Use `find_window` to get the window's position (e.g., title bar coordinates `x`, `y`).
+    2.  Call `move_mouse` to position the cursor on the title bar (e.g., `x`, `y + 10`).
+    3.  Call `wait(duration_ms=150)` to ensure the cursor is settled.
+    4.  Call `mouse_action` with `button: "Left", click_type: "Press"` to grab the title bar.
+    5.  Call `wait(duration_ms=100)` to ensure the press is registered.
+    6.  Call `move_mouse` to the *new* desired window position (e.g., `new_x`, `new_y + 10`).
+    7.  Call `wait(duration_ms=100)` to ensure the move is complete.
+    8.  Call `mouse_action` with `button: "Left", click_type: "Release"` to drop the window.
+
+    **Interaction:**
+    * Ask for clarification if a request is ambiguous or requires information you don't have (e.g., "Where should I move the window?").
+    * Inform the user upon successful completion of the overall task.
+    * Report any errors encountered during tool execution."#.to_string();
+
 
     // Add initial system message
     conversation_history.push_back(ChatCompletionRequestMessage::System(ChatCompletionRequestSystemMessage{
-        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()), // Clone system prompt text
+        content: ChatCompletionRequestSystemMessageContent::Text(system_prompt.clone()), 
         name: None
     }));
 
@@ -185,7 +239,7 @@ async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
                 if let Some(ChatCompletionRequestMessage::Tool(_)) = conversation_history.get(1) {
                         // This should NOT happen with the current logic if VecDeque::remove(1) works as expected.
                         error!("CRITICAL: History state invalid after trimming! Message at index 1 is Tool.");
-                        debug!("Invalid History State: {:?}", conversation_history);
+                        debug!("Invalid History State: {:#?}", conversation_history);
                         // Handle this critical error, maybe break or return?
                         println!("Internal error: Invalid conversation history state detected. Please report this.");
                         break; // Break inner loop
@@ -193,200 +247,245 @@ async fn run_gpt_computer_use() -> anyhow::Result<(), anyhow::Error> {
             }
 
             info!("Sending request to OpenAI chat model...");
-            info!("Conversation History (len={}): {:?}", conversation_history.len(), conversation_history); // Log length and content
+            info!("Conversation History (len={}): {:#?}", conversation_history.len(), conversation_history); // Log length and content
 
             let request = CreateChatCompletionRequest {
                 model: OPENAI_CHAT_MODEL.to_string(),
                 messages: conversation_history.iter().cloned().collect(), // Use current trimmed history
                 tools: if openai_tools.is_empty() { None } else { Some(openai_tools.clone()) },
                 tool_choice: if openai_tools.is_empty() { None } else { Some(ChatCompletionToolChoiceOption::Auto) },
+                stream: Some(true),
+                parallel_tool_calls: Some(true),
                 ..Default::default()
             };
 
-            let response = match openai_client.chat().create(request).await {
-                 Ok(res) => res,
-                 Err(e) => {
-                     // *** Use match on OpenAIError variants instead of downcast_ref ***
-                     error!("OpenAI API error: {}", e);
+            // --- Stream Handling ---
+            let mut stream = match openai_client.chat().create_stream(request).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("OpenAI API stream creation error: {}", e);
+                    // Handle error appropriately (e.g., print message, break inner loop)
                      match e {
-                         OpenAIError::ApiError(api_error) => {
-                              error!("OpenAI API Error Details: {:?}", api_error);
-                              if let Some(code) = &api_error.code {
-                                   println!("OpenAI Error Code: {}", code);
-                              }
-                         }
-                         OpenAIError::Reqwest(req_err) => {
-                              error!("Network Error Details: {:?}", req_err);
-                         }
-                         // Add other OpenAIError variants as needed
-                         _ => {
-                              error!("Other OpenAI Error: {:?}", e);
-                         }
+                         OpenAIError::ApiError(api_error) => { error!("--> API Error Details: {:#?}", api_error); }
+                         OpenAIError::Reqwest(req_err) => { error!("--> Network Error Details: {:#?}", req_err); }
+                         _ => { error!("--> Other OpenAI Error: {:#?}", e); }
                      }
-                     println!("Error communicating with OpenAI. Please check logs and API key/quota. Try again.");
-                     // Don't pop the user message if the API call fails, allow user to retry or quit
-                     // conversation_history.pop_back(); // Removed this line
-                     break; // Break inner loop, go back to waiting for user input
-                 }
-            };
-
-
-            let choice = match response.choices.into_iter().next() {
-                 Some(ch) => ch,
-                 None => {
-                     warn!("No choices received from OpenAI.");
-                     println!("OpenAI did not provide a response.");
+                     println!("Error starting communication with OpenAI. Check logs.");
                      break; // Break inner loop
+                }
+            };
+
+            let mut full_response_content = String::new();
+            // Use HashMap to reconstruct tool calls based on index from deltas
+            let mut partial_tool_calls: HashMap<u32, PartialToolCall> = HashMap::new();
+            let mut final_tool_calls: Vec<async_openai::types::ChatCompletionMessageToolCall> = Vec::new(); // Store fully formed calls
+
+            print!("\nAssistant (Streaming): "); // Indicate streaming start
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(stream_response) => {
+                        for choice in stream_response.choices {
+                            let delta = choice.delta;
+
+                            // Accumulate content
+                            if let Some(content_chunk) = delta.content {
+                                print!("{}", content_chunk); // Print content chunk immediately
+                                use std::io::Write; // Import Write trait for flush
+                                std::io::stdout().flush().unwrap_or_default(); // Ensure chunk is displayed
+                                full_response_content.push_str(&content_chunk);
+                            }
+
+                            // Accumulate tool calls (handle partial deltas)
+                            if let Some(delta_tool_calls) = delta.tool_calls {
+                                for tool_call_chunk in delta_tool_calls {
+                                    let index = tool_call_chunk.index; // Index is key for reconstruction
+                                    let partial = partial_tool_calls.entry(index).or_default();
+                                    partial.index = Some(index as usize); // Store index
+
+                                    if let Some(id) = tool_call_chunk.id {
+                                        partial.id = Some(id);
+                                    }
+                                    if let Some(function) = tool_call_chunk.function {
+                                        if let Some(name) = function.name {
+                                            partial.name = Some(name);
+                                        }
+                                        if let Some(args_chunk) = function.arguments {
+                                            partial.arguments.push_str(&args_chunk);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Error receiving stream chunk: {}", e);
+                        // Handle stream error (e.g., maybe break or try to continue)
+                        println!("\nError during streaming response from OpenAI.");
+                        // Potentially break or set an error flag
+                    }
+                }
+            }
+            println!(); // Newline after streaming finishes
+
+
+                        // --- Process Accumulated Response ---
+
+            // Finalize reconstructed tool calls
+            for (_index, partial) in partial_tool_calls.into_iter() {
+                 if let (Some(id), Some(name)) = (partial.id.clone(), partial.name.clone()) {
+                     final_tool_calls.push(async_openai::types::ChatCompletionMessageToolCall {
+                         id,
+                         r#type: async_openai::types::ChatCompletionToolType::Function, // Assuming function type
+                         function: async_openai::types::FunctionCall {
+                             name,
+                             arguments: partial.arguments,
+                         },
+                     });
+                 } else {
+                     warn!("Incomplete tool call received via stream delta: index={:?}, partial={:?}", partial.index, partial);
                  }
+            }
+
+
+
+            // Add the complete Assistant message to history
+            let assistant_message = ChatCompletionRequestAssistantMessage {
+                content: if full_response_content.is_empty() { None } else { Some(ChatCompletionRequestAssistantMessageContent::Text(full_response_content.clone())) },
+                tool_calls: if final_tool_calls.is_empty() { None } else { Some(final_tool_calls.clone()) },
+                ..Default::default() // Use default for other fields like name, refusal, audio
             };
+            conversation_history.push_back(ChatCompletionRequestMessage::Assistant(assistant_message));
 
-            // Construct the assistant message based on the response choice
-            let assistant_message_request = ChatCompletionRequestAssistantMessage {
-                content: choice.message.content.clone().map(ChatCompletionRequestAssistantMessageContent::Text),
-                name: None,
-                tool_calls: choice.message.tool_calls.clone(),
-                function_call: choice.message.function_call.clone(), // Keep for older models if needed
-                audio: None, // Assuming no audio response for now
-                refusal: None, // Assuming no refusal content for now
-            };
+            // --- Handle Tool Calls (Parallel Execution) ---
+            if !final_tool_calls.is_empty() {
+                info!("Executing {} tool call(s) in parallel...", final_tool_calls.len());
 
-            // Add Assistant message directly
-            conversation_history.push_back(ChatCompletionRequestMessage::Assistant(assistant_message_request.clone()));
+                let mut tool_tasks: Vec<JoinHandle<(String, String, Result<rmcp::model::CallToolResult, rmcp::ServiceError>)>> = Vec::new();
 
-
-            // --- Handle Tool Calls ---
-            if let Some(tool_calls) = assistant_message_request.tool_calls {
-                info!("OpenAI requested {} tool call(s).", tool_calls.len());
-
-                for tool_call in tool_calls {
+                for tool_call in final_tool_calls {
                     let call_id = tool_call.id.clone();
                     let function_call = tool_call.function;
                     let tool_name = function_call.name;
                     let arguments_str = function_call.arguments;
 
-                    let arguments_value: Value = match serde_json::from_str(&arguments_str) {
-                        Ok(args) => args,
+                    // Parse arguments (handle potential errors)
+                    let arguments_map: Option<Map<String, Value>> = match serde_json::from_str(&arguments_str) {
+                        Ok(Value::Object(map)) => Some(map),
+                        Ok(_) => {
+                            warn!("Tool arguments were not a JSON object for tool '{}'. Treating as empty.", tool_name);
+                            None
+                        }
                         Err(e) => {
                             error!("Failed to parse arguments JSON string for tool '{}': {} (Args: '{}')", tool_name, e, arguments_str);
+                            // Immediately add error result for this tool call
                             let error_msg = format!("Invalid JSON arguments provided by AI for tool '{}': {}", tool_name, e);
-                            // Add Tool message with error directly
                             conversation_history.push_back(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
-                                tool_call_id: call_id,
+                                tool_call_id: call_id.clone(), // Clone id here
                                 content: ChatCompletionRequestToolMessageContent::Text(error_msg)
                             }));
-                            continue; // Skip this tool call, proceed to next tool call or next API iteration
+                            continue; // Skip spawning task for this invalid call
                         }
                     };
 
-                    // Ensure arguments are a JSON object for MCP
-                    let arguments_map: Option<Map<String, Value>> = match arguments_value {
-                        Value::Object(map) => Some(map),
-                        _ => {
-                            warn!("Tool arguments were not a JSON object for tool '{}'. Treating as empty.", tool_name);
-                            None // Send None if not an object
-                        }
-                    };
+                    info!("Spawning task for MCP tool '{}' (call_id: {}) with args: {:#?}", tool_name, call_id, arguments_map);
 
-                    info!("Calling MCP tool '{}' with args: {:?}", tool_name, arguments_map);
+                    let mcp_peer_clone = mcp_peer.clone();
+                    let mcp_request = CallToolRequestParam { name: tool_name.clone().into(), arguments: arguments_map };
+                    let call_id_clone = call_id.clone();
+                    let tool_name_clone = tool_name.clone(); // Clone tool_name for the task
 
-                    // --- Call MCP Server Tool ---
-                    let mcp_request = CallToolRequestParam {
-                        name: tool_name.clone().into(),
-                        arguments: arguments_map,
-                    };
-
-                    let tool_result_content_str: String = match mcp_peer.call_tool(mcp_request.clone()).await {
-                        Ok(mcp_result) => {
-                            info!("MCP tool '{}' executed successfully.", mcp_request.name);
-                            // *** Use mcp_result.content, not .contents ***
-                            match mcp_result.content.into_iter().next() {
-                                Some(content) => {
-                                    match content.raw {
-                                        RawContent::Text(raw_text_content) => {
-                                            // Special handling for screen capture analysis
-                                            if mcp_request.name == "capture_screen" {
-                                                info!("Received screen capture result, attempting analysis...");
-                                                match serde_json::from_str::<Value>(&raw_text_content.text) {
-                                                    Ok(json_val) => {
-                                                        if let Some(base64_data) = json_val.get("base64_data").and_then(|v| v.as_str()) {
-                                                            let vision_prompt = "Describe this screenshot in detail. If there is a text editor open, please also read the text visible within it.".to_string();
-                                                            match analyze_image_with_vision(&openai_client, vision_prompt, base64_data).await {
-                                                                Ok(description) => {
-                                                                    info!("Vision analysis successful.");
-                                                                    description
-                                                                }
-                                                                Err(e) => {
-                                                                    error!("Vision analysis failed: {}", e);
-                                                                    format!("Screenshot captured but vision analysis failed: {}", e)
-                                                                }
-                                                            }
-                                                        } else {
-                                                            warn!("capture_screen result JSON did not contain 'base64_data' string.");
-                                                            raw_text_content.text // Return raw JSON if no base64 data
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        warn!("Failed to parse capture_screen result as JSON: {}. Returning raw text.", e);
-                                                        raw_text_content.text // Return raw text if JSON parsing fails
-                                                    }
-                                                }
-                                            } else {
-                                                raw_text_content.text // Return text for other tools
-                                            }
-                                        }
-                                        _ => format!("Tool '{}' returned non-text content.", mcp_request.name),
-                                    }
-                                }
-                                None => format!("Tool '{}' executed successfully but returned no content.", mcp_request.name),
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to call MCP tool '{}': {}", mcp_request.name, e);
-                            // Return error as JSON string for OpenAI
-                            json!({
-                                "status": "error",
-                                "message": format!("Failed to execute tool '{}' via MCP: {}", mcp_request.name, e)
-                            }).to_string()
-                        }
-                    };
-
-
-                    // Add Tool message with result/error directly
-                    conversation_history.push_back(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
-                        tool_call_id: call_id,
-                        content: ChatCompletionRequestToolMessageContent::Text(tool_result_content_str)
+                    // Spawn the MCP tool call task
+                    tool_tasks.push(tokio::spawn(async move {
+                        let result = mcp_peer_clone.call_tool(mcp_request).await;
+                        (call_id_clone, tool_name_clone, result) // Return call_id, tool_name, result
                     }));
                 }
-                continue; // Continue the inner OpenAI loop to send tool results back
 
-            } else if let Some(content) = assistant_message_request.content {
-                // --- Handle Regular Assistant Message ---
-                match content {
-                    ChatCompletionRequestAssistantMessageContent::Text(text)=>{
-                        info!("OpenAI final response: {}",text);
-                        println!("\nAssistant:\n{}",text);
-                    }
-                    ChatCompletionRequestAssistantMessageContent::Array(parts) => {
-                        info!("OpenAI final response: [Multipart Content]");
-                        let mut combined_text = String::new();
-                        for part in parts {
-                            // *** Use correct import path for variants ***
-                            if let ChatCompletionRequestAssistantMessageContentPart::Text(text_part) = part {
-                                combined_text.push_str(&text_part.text);
-                                combined_text.push('\n');
-                            } else if let ChatCompletionRequestAssistantMessageContentPart::Refusal(refusal_part) = part {
-                                combined_text.push_str(&format!("[Refusal Content]\n{refusal_part:?}"));
-                            }
-                            // Note: Need to handle ImageUrl part if expecting it in assistant responses
+                // Wait for all tool call tasks to complete
+                let task_results = join_all(tool_tasks).await;
+                // Use a temporary vec to store results before adding to history to avoid borrowing issues
+                let mut tool_message_results = Vec::new();
+
+                // Process results and add Tool messages to history
+                for task_result in task_results {
+                    match task_result {
+                        Ok((call_id, tool_name, mcp_call_result)) => {
+                            // Process the result in an async block to allow calling analyze_image_with_vision
+                            let tool_result_content_str = async {
+                                match mcp_call_result {
+                                    Ok(mcp_result_data) => {
+                                        info!("MCP tool '{}' (call_id: '{}') executed successfully.", tool_name, call_id);
+                                        match mcp_result_data.content.into_iter().next() {
+                                            Some(content) => match content.raw {
+                                                RawContent::Text(raw_text) => {
+                                                    // <<< Check if it was capture_screen >>>
+                                                    if tool_name == "capture_screen" {
+                                                        info!("Processing capture_screen result (call_id: {})...", call_id);
+                                                        match serde_json::from_str::<Value>(&raw_text.text) {
+                                                            Ok(json_val) => {
+                                                                if let Some(base64_data) = json_val.get("base64_data").and_then(|v| v.as_str()) {
+                                                                    let vision_prompt = "Describe this screenshot in detail, focusing on visible text, UI elements, and overall layout.".to_string();
+                                                                    // Call vision analysis
+                                                                    match analyze_image_with_vision(&openai_client, vision_prompt, base64_data).await {
+                                                                        Ok(desc) => { info!("Vision analysis successful for call_id: {}", call_id); desc }
+                                                                        Err(e) => { error!("Vision analysis failed for call_id '{}': {}", call_id, e); format!("Screenshot captured but vision analysis failed: {}", e) }
+                                                                    }
+                                                                } else {
+                                                                    warn!("capture_screen JSON missing 'base64_data' for call_id: {}", call_id);
+                                                                    raw_text.text // Return raw JSON if no base64
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("Failed to parse capture_screen JSON for call_id '{}': {}. Returning raw text.", call_id, e);
+                                                                raw_text.text // Return raw text if parse fails
+                                                            }
+                                                        }
+                                                    } else {
+                                                        raw_text.text // Return text for other tools
+                                                    }
+                                                }
+                                                _ => format!("Tool '{}' (call_id: '{}') returned non-text content.", tool_name, call_id),
+                                            },
+                                            None => format!("Tool '{}' (call_id: '{}') returned no content.", tool_name, call_id),
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("MCP tool '{}' (call_id: '{}') failed: {}", tool_name, call_id, e);
+                                        json!({ "status": "error", "message": format!("Failed MCP execution for tool '{}' (call_id: '{}'): {}", tool_name, call_id, e) }).to_string()
+                                    }
+                                }
+                            }.await; // Await the async block processing the result
+
+                            // Store the result to be added later
+                            tool_message_results.push(ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage{
+                                tool_call_id: call_id,
+                                content: ChatCompletionRequestToolMessageContent::Text(tool_result_content_str)
+                            }));
                         }
-                        println!("\nAssistant:\n{}", combined_text.trim());
+                        Err(join_err) => {
+                            error!("Tool execution task failed to join: {}", join_err);
+                            // Optionally add a generic error message to history here if needed
+                        }
                     }
                 }
 
-                break; // Break inner loop, assistant gave final answer, wait for next user input
+                // *** Add the collected tool results to the main history ***
+                info!("Adding {} tool result messages to history.", tool_message_results.len());
+                for msg in tool_message_results {
+                    conversation_history.push_back(msg);
+                }
+
+                // After processing all tool results, continue the inner loop to send them back
+                continue;
+
+            } else if !full_response_content.is_empty() {
+                // --- Handle Regular Assistant Message (No Tool Calls) ---
+                info!("OpenAI final streaming response: {}", full_response_content);
+                // Already printed during streaming, just break
+                break; // Break inner loop, wait for next user input
 
             } else {
-                 warn!("OpenAI response had neither content nor tool calls.");
+                 warn!("OpenAI stream finished with no content and no tool calls.");
                  println!("Assistant provided an empty response.");
                  break; // Break inner loop
             }
@@ -425,7 +524,6 @@ async fn analyze_image_with_vision<C: Config>(
     let request = CreateChatCompletionRequest {
         model: OPENAI_VISION_MODEL.to_string(),
         messages: vec![request_message],
-        max_tokens: Some(1024), // Add max_tokens for vision model
         ..Default::default()
     };
 
@@ -433,13 +531,13 @@ async fn analyze_image_with_vision<C: Config>(
     let response = client.chat().create(request).await
         // *** Added detailed error logging using map_err ***
         .map_err(|e| {
-            error!("Vision API call failed. Error details: {:?}", e);
+            error!("Vision API call failed. Error details: {:#?}", e);
              match &e {
                  OpenAIError::ApiError(api_error) => {
-                      error!("--> Specific Vision API Error: {:?}", api_error);
+                      error!("--> Specific Vision API Error: {:#?}", api_error);
                  }
                  OpenAIError::Reqwest(req_err) => {
-                       error!("--> Specific Vision Network Error: {:?}", req_err);
+                       error!("--> Specific Vision Network Error: {:#?}", req_err);
                  }
                  _ => {} // Other error types already logged by the top-level error! macro
              }
